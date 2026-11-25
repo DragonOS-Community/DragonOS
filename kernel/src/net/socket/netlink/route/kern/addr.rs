@@ -26,6 +26,7 @@ use crate::{
             address_info, ipv6_lifetime::ConfiguredLifetimes, AddressInfo, AddressMutation,
             AddressMutationOutcome, AddressOptions,
         },
+        route::RTN_MULTICAST,
         rtnl::RtnlGuard,
     },
     process::namespace::net_namespace::NetNamespace,
@@ -72,7 +73,7 @@ pub(super) fn do_new_addr(
         } else {
             AddressMutation::Add(cidr)
         };
-    let commit = crate::net::address::mutate_address_with_options(
+    let mut commit = crate::net::address::mutate_address_with_options(
         rtnl,
         &iface,
         mutation,
@@ -83,6 +84,16 @@ pub(super) fn do_new_addr(
             ipv6_lifetimes,
         },
     )?;
+    // A new IPv6 address initializes the multicast route before RTM_NEWADDR.
+    if let Some(index) = commit
+        .route_changes
+        .added
+        .iter()
+        .position(|route| route.kind == RTN_MULTICAST)
+    {
+        let route = commit.route_changes.added.remove(index);
+        super::route::notify_route(&netns, CSegmentType::NEWROUTE, route);
+    }
     match commit.outcome {
         AddressMutationOutcome::Added(cidr) => notify_address_change(netns.clone(), &iface, cidr),
         AddressMutationOutcome::Replaced(cidr)

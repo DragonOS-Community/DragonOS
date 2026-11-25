@@ -542,6 +542,7 @@ fn lookup_route(
         )?;
         if fib_match {
             return Ok(vec![RouteNlSegment::NewRoute(route_to_segment(
+                &netns,
                 request.header(),
                 CSegmentType::NEWROUTE,
                 decision.matched,
@@ -572,6 +573,7 @@ fn lookup_route(
         ..decision.matched
     };
     Ok(vec![RouteNlSegment::NewRoute(route_to_segment(
+        &netns,
         request.header(),
         CSegmentType::NEWROUTE,
         output,
@@ -623,6 +625,7 @@ fn lookup_ipv6_input_route(
         (resolved, RouteReply::Resolved)
     };
     Ok(vec![RouteNlSegment::NewRoute(route_to_segment(
+        netns,
         request.header(),
         CSegmentType::NEWROUTE,
         entry,
@@ -667,6 +670,7 @@ fn notify_route_with_flags(
     nlmsg_flags: u16,
 ) {
     let segment = match route_to_segment(
+        netns,
         &kernel_notify_header(kind),
         kind,
         route,
@@ -702,6 +706,7 @@ pub(super) enum RouteReply {
 }
 
 pub(super) fn route_to_segment(
+    netns: &NetNamespace,
     request_header: &CMsgSegHdr,
     msg_type: CSegmentType,
     route: RouteEntry,
@@ -709,13 +714,27 @@ pub(super) fn route_to_segment(
     nlmsg_flags: u16,
     input_ifindex: Option<u32>,
 ) -> Result<RouteSegment, SystemError> {
-    let body_flags = match reply {
+    let mut body_flags = match reply {
         RouteReply::Resolved if input_ifindex.is_none() => RouteFlags::CLONED,
         RouteReply::Resolved => RouteFlags::empty(),
         RouteReply::Configuration | RouteReply::FibMatch => {
             RouteFlags::from_bits_truncate(route.nexthop_flags as u32)
         }
     };
+    if reply != RouteReply::Resolved
+        && route.kind == route::RTN_MULTICAST
+        && matches!(route.destination.address(), IpAddress::Ipv6(_))
+        && netns
+            .device_list()
+            .get(&(route.oif as usize))
+            .is_some_and(|iface| {
+                iface
+                    .net_state()
+                    .contains(crate::driver::net::NetDeivceState::__LINK_STATE_NOCARRIER)
+            })
+    {
+        body_flags.insert(RouteFlags::LINKDOWN);
+    }
     let body = RouteSegmentBody {
         family: family_of_ip(route.destination.address()),
         dst_len: route.destination.prefix_len(),

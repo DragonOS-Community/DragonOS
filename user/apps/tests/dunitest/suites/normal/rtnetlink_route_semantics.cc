@@ -982,6 +982,82 @@ TEST(RtnetlinkRouteSemantics, Ipv6FibMatchReturnsTheConfiguredRoute) {
     EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
+TEST(RtnetlinkRouteSemantics, Ipv6MulticastRouteFollowsReadinessAndExplicitConfiguration) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << ErrnoString(errno);
+    if (child == 0) {
+        [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard fd(OpenRouteSocket());
+            ASSERT_GE(fd.Get(), 0);
+            uint32_t seq = 9700;
+            constexpr char name[] = "mroute97";
+            constexpr uint16_t add = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+            const struct {
+                rtattr header;
+                char kind[RTA_ALIGN(sizeof("veth"))];
+            } info{{RTA_LENGTH(sizeof("veth")), IFLA_INFO_KIND}, "veth"};
+            alignas(nlmsghdr) char buffer[128]{};
+            auto* request = reinterpret_cast<nlmsghdr*>(buffer);
+            request->nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+            request->nlmsg_type = RTM_NEWLINK;
+            request->nlmsg_flags = add;
+            request->nlmsg_seq = ++seq;
+            AddAttr(request, sizeof(buffer), IFLA_IFNAME, name, sizeof(name));
+            AddAttr(request, sizeof(buffer), IFLA_LINKINFO, &info, sizeof(info));
+            ASSERT_EQ(send(fd.Get(), request, request->nlmsg_len, 0),
+                      static_cast<ssize_t>(request->nlmsg_len));
+            ASSERT_EQ(RecvAck(fd.Get(), seq), 0);
+            const uint32_t edge = if_nametoindex(name);
+            const uint32_t peer = if_nametoindex("veth0");
+            ASSERT_NE(edge, 0u);
+            ASSERT_NE(peer, 0u);
+            auto set_mode = [](const char (&value)[3]) {
+                FdGuard setting(open("/proc/sys/net/ipv6/conf/mroute97/addr_gen_mode", O_WRONLY));
+                return setting.Get() >= 0 && write(setting.Get(), value, 2) == 2;
+            };
+            auto route = [&] {
+                return FindIpv6Route(fd.Get(), "ff00::", 8, edge, ++seq, RTN_MULTICAST);
+            };
+            auto wait_for_route = [&](bool linkdown) {
+                for (int retry = 0; retry < 100; ++retry) {
+                    const auto entry = route();
+                    if (entry && ((entry->flags & RTNH_F_LINKDOWN) != 0) == linkdown) return true;
+                    usleep(10000);
+                }
+                return false;
+            };
+            ASSERT_TRUE(set_mode("1\n"));
+            ASSERT_EQ(SetLinkUp(fd.Get(), edge, true, ++seq), 0);
+            EXPECT_FALSE(route());
+            ASSERT_EQ(SetLinkUp(fd.Get(), peer, true, ++seq), 0);
+            EXPECT_TRUE(wait_for_route(false));
+            ASSERT_EQ(SetLinkUp(fd.Get(), peer, false, ++seq), 0);
+            EXPECT_TRUE(wait_for_route(true));
+            ASSERT_EQ(SetLinkUp(fd.Get(), edge, false, ++seq), 0);
+            EXPECT_FALSE(route());
+
+            ASSERT_EQ(SetLinkUp(fd.Get(), edge, true, ++seq), 0);
+            EXPECT_FALSE(route());
+            ASSERT_EQ(SendIpv6AddrRequest(fd.Get(), RTM_NEWADDR, add, edge,
+                                          "fd97::1", 64, ++seq), 0);
+            EXPECT_TRUE(wait_for_route(true));
+
+            ASSERT_EQ(SetLinkUp(fd.Get(), edge, false, ++seq), 0);
+            EXPECT_FALSE(route());
+            ASSERT_EQ(SetLinkUp(fd.Get(), edge, true, ++seq), 0);
+            EXPECT_FALSE(route());
+            ASSERT_TRUE(set_mode("0\n"));
+            EXPECT_TRUE(wait_for_route(true));
+        }();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child) << ErrnoString(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST(RtnetlinkRouteSemantics, Ipv6RejectTerminatesLookupAndThrowSkipsTheTable) {
     const pid_t child = fork();
     ASSERT_GE(child, 0);

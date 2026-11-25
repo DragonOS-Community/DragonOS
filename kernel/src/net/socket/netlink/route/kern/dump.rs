@@ -298,6 +298,7 @@ impl DumpSession {
                     return Ok(None);
                 }
                 Ok(Some(RouteNlSegment::NewRoute(route::route_to_segment(
+                    netns,
                     request.header(),
                     CSegmentType::NEWROUTE,
                     entry,

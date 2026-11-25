@@ -17,8 +17,9 @@ use crate::driver::net::{
 use crate::net::{
     ipv6_defrag::{fragment_offset, DefragDomain},
     output::submit_prepared_ipv6_before_enqueue,
-    route::{OutputRouteDecision, RTN_MULTICAST, RT_TABLE_LOCAL},
+    route::{OutputRouteDecision, RouteEntry, RTN_MULTICAST, RT_TABLE_LOCAL},
     rtnl,
+    socket::netlink::notify_automatic_ipv6_route,
 };
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::time::Instant;
@@ -109,6 +110,7 @@ pub(crate) struct DeviceState {
     dad_transmits: i32,
     pub(crate) keep_addr_on_down: i32,
     ready_seen: bool,
+    multicast_initialized: bool,
     dad_ready: bool,
     retry: Option<i64>,
     probes: Vec<Probe>,
@@ -124,6 +126,7 @@ impl Default for DeviceState {
             dad_transmits: 1,
             keep_addr_on_down: 0,
             ready_seen: false,
+            multicast_initialized: false,
             dad_ready: false,
             retry: None,
             probes: Vec::new(),
@@ -143,7 +146,26 @@ impl Setting {
         }
     }
 
-    pub(crate) fn write(self, common: &IfaceCommon, value: i32) -> Result<(), SystemError> {
+    pub(crate) fn write(
+        self,
+        rtnl: &rtnl::RtnlGuard,
+        netns: &Arc<NetNamespace>,
+        iface: &dyn Iface,
+        value: i32,
+    ) -> Result<(), SystemError> {
+        let common = iface.common();
+        if matches!(self, Self::AddrGenMode) && matches!(value, 0 | 1) && self.read(common) != value
+        {
+            match crate::net::route::ensure_ipv6_multicast_route(rtnl, netns, iface) {
+                Ok(Some(route)) => notify_automatic_ipv6_route(netns, route, false, false),
+                Ok(None) => {}
+                Err(error) => log::warn!(
+                    "Could not install IPv6 multicast route on {}: {:?}",
+                    iface.iface_name(),
+                    error
+                ),
+            }
+        }
         let mut state = common.ipv6_autoconf.lock();
         match self {
             Self::AddrGenMode if matches!(value, 0 | 1) => {
@@ -200,6 +222,7 @@ pub(crate) fn cancel(common: &IfaceCommon) {
         let mut state = common.ipv6_autoconf.lock();
         state.retry = None;
         state.ready_seen = false;
+        state.multicast_initialized = false;
         state.dad_ready = false;
         state.solicitation.link_reset();
         core::mem::take(&mut state.probes)
@@ -312,6 +335,43 @@ pub(crate) fn poll(netns: &Arc<NetNamespace>) -> Option<i64> {
     next
 }
 
+/// Finish the synchronous part of a ready administrative link transition.
+pub(crate) fn initialize_ready_multicast_route(
+    rtnl: &rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    iface: &dyn Iface,
+) -> Option<RouteEntry> {
+    if iface.flags().contains(InterfaceFlags::UP)
+        && iface.common().ipv6_device_present()
+        && iface.common().ipv6_enabled()
+        && carrier_ready(iface)
+    {
+        return initialize_multicast_route(rtnl, netns, iface, Instant::now().total_micros());
+    }
+    None
+}
+
+fn initialize_multicast_route(
+    rtnl: &rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    iface: &dyn Iface,
+    now: i64,
+) -> Option<RouteEntry> {
+    let common = iface.common();
+    let should_initialize = {
+        let state = common.ipv6_autoconf.lock();
+        !state.multicast_initialized && state.retry.is_none_or(|due| due <= now)
+    };
+    if should_initialize {
+        let result = crate::net::route::ensure_ipv6_multicast_route(rtnl, netns, iface);
+        let mut state = common.ipv6_autoconf.lock();
+        state.multicast_initialized = result.is_ok();
+        state.retry = result.as_ref().err().map(|_| now.saturating_add(RETRY_US));
+        return result.ok().flatten();
+    }
+    None
+}
+
 fn poll_device(
     rtnl: &rtnl::RtnlGuard,
     netns: &Arc<NetNamespace>,
@@ -326,10 +386,16 @@ fn poll_device(
     }
     let carrier = carrier_ready(iface.as_ref());
     let common = iface.common();
+    if carrier {
+        if let Some(route) = initialize_multicast_route(rtnl, netns, iface.as_ref(), now) {
+            notify_automatic_ipv6_route(netns, route, false, false);
+        }
+    }
     let (start, accept_dad, dad_ready) = {
         let mut state = common.ipv6_autoconf.lock();
         state.dad_ready |= carrier;
         let start = carrier
+            && state.multicast_initialized
             && state.mode == 0
             && !state.ready_seen
             && state.retry.is_none_or(|due| due <= now);

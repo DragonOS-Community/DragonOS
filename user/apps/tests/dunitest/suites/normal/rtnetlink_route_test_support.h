@@ -625,6 +625,7 @@ struct Ipv6RouteMetadata {
     uint8_t scope = RT_SCOPE_NOWHERE;
     bool has_preferred_source = false;
     std::optional<int32_t> expires;
+    uint32_t flags = 0;
 };
 
 std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
@@ -718,7 +719,7 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
             }
             if (actual_oif == oif && std::memcmp(&actual, &expected, sizeof(actual)) == 0) {
                 found = Ipv6RouteMetadata{priority, route_msg->rtm_scope,
-                                          has_preferred_source, expires};
+                                          has_preferred_source, expires, route_msg->rtm_flags};
             }
         }
     }

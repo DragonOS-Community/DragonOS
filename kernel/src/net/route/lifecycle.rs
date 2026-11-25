@@ -184,7 +184,6 @@ pub(crate) fn prepare_link_state_change<'rtnl>(
                 &iface.common().ip_addrs(),
                 &metadata,
                 true,
-                iface.common().ipv6_device_present() && iface.common().ipv6_enabled(),
             )? {
                 // insert_derived() is the lifecycle authority here: the first
                 // UP publishes every deferred constructor address route,
@@ -262,6 +261,7 @@ pub(crate) struct AddressLinkChange<'a> {
     pub metadata: Vec<AddressMetadata>,
     pub deleted_addresses: &'a [IpAddress],
     pub ipv6_prefix_change: Option<Ipv6PrefixChange>,
+    pub ensure_mroute: bool,
     pub was_up: bool,
     pub is_up: bool,
     pub ipv6_enabled: Option<bool>,
@@ -285,6 +285,7 @@ impl PreparedAddressRouteCommit {
             metadata,
             deleted_addresses,
             ipv6_prefix_change,
+            ensure_mroute,
             was_up,
             is_up,
             ipv6_enabled,
@@ -323,21 +324,10 @@ impl PreparedAddressRouteCommit {
         let mut candidate = before.try_clone()?;
         let mut before_routes = {
             let old_metadata = iface.common().address_metadata().lock();
-            derived_address_entries_for_link_state(
-                iface,
-                before_addresses,
-                &old_metadata,
-                was_up,
-                was_ipv6_enabled,
-            )?
+            derived_address_entries_for_link_state(iface, before_addresses, &old_metadata, was_up)?
         };
-        let mut after_address_routes = derived_address_entries_for_link_state(
-            iface,
-            after_addresses,
-            &metadata,
-            was_up,
-            is_ipv6_enabled,
-        )?;
+        let mut after_address_routes =
+            derived_address_entries_for_link_state(iface, after_addresses, &metadata, was_up)?;
         let prefix_change = ipv6_prefix_change
             .filter(|_| is_up && !iface.flags().contains(InterfaceFlags::LOOPBACK))
             .map(|change| {
@@ -409,6 +399,11 @@ impl PreparedAddressRouteCommit {
             }
             None => None,
         };
+        if ensure_mroute {
+            if let Some(route) = ipv6_multicast_route(iface.as_ref(), is_up, is_ipv6_enabled) {
+                editor.insert_derived(route)?;
+            }
+        }
         if withdraw_ipv6_routes {
             editor.remove_where(remove_for_ipv6)?;
         }
@@ -431,13 +426,9 @@ impl PreparedAddressRouteCommit {
             }
         } else if !was_up && is_up {
             let mut state_editor = FibEditor::new(&mut candidate);
-            for entry in derived_address_entries_for_link_state(
-                iface,
-                after_addresses,
-                &metadata,
-                true,
-                is_ipv6_enabled,
-            )? {
+            for entry in
+                derived_address_entries_for_link_state(iface, after_addresses, &metadata, true)?
+            {
                 state_editor.insert_derived(entry)?;
             }
             for oif in state_editor.finish()? {
@@ -646,8 +637,53 @@ fn derived_address_entries(
         addresses,
         metadata,
         iface.flags().contains(InterfaceFlags::UP),
-        iface.common().ipv6_device_present() && iface.common().ipv6_enabled(),
     )
+}
+
+fn ipv6_multicast_route(iface: &dyn Iface, is_up: bool, ipv6_enabled: bool) -> Option<RouteEntry> {
+    if !is_up
+        || !ipv6_enabled
+        || iface.mtu() < crate::net::address::IPV6_MIN_MTU
+        || iface.flags().contains(InterfaceFlags::LOOPBACK)
+    {
+        return None;
+    }
+    Some(RouteEntry {
+        destination: IpCidr::Ipv6(Ipv6Cidr::new(
+            smoltcp::wire::Ipv6Address::from([0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            8,
+        )),
+        source: None,
+        preferred_source: None,
+        table: RT_TABLE_LOCAL,
+        priority: 256,
+        tos: 0,
+        protocol: RTPROT_KERNEL,
+        scope: RT_SCOPE_UNIVERSE,
+        kind: RTN_MULTICAST,
+        oif: iface.nic_id() as u32,
+        gateway: None,
+        nexthop_flags: 0,
+        ipv6_address_local: false,
+        ipv6_metadata: None,
+    })
+}
+
+pub(crate) fn ensure_ipv6_multicast_route(
+    rtnl: &RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    iface: &dyn Iface,
+) -> Result<Option<RouteEntry>, SystemError> {
+    let Some(route) = ipv6_multicast_route(
+        iface,
+        iface.flags().contains(InterfaceFlags::UP),
+        iface.common().ipv6_device_present() && iface.common().ipv6_enabled(),
+    ) else {
+        return Ok(None);
+    };
+    let edit =
+        commit_automatic_ipv6_route_edit(rtnl, netns, |fib| fib.plan_multicast_route(route))?;
+    Ok(matches!(edit, FibEdit::Insert { .. }).then_some(route))
 }
 
 fn derived_address_entries_for_link_state(
@@ -655,36 +691,8 @@ fn derived_address_entries_for_link_state(
     addresses: &[IpCidr],
     metadata: &[AddressMetadata],
     is_up: bool,
-    ipv6_enabled: bool,
 ) -> Result<Vec<RouteEntry>, SystemError> {
     let mut result = Vec::new();
-    // Linux addrconf_add_dev() installs this route when IPv6 is enabled on a
-    // non-loopback device, even before it has a unicast address. The regular
-    // device DOWN/UP transaction removes and restores it with other routes.
-    if is_up && ipv6_enabled && !iface.flags().contains(InterfaceFlags::LOOPBACK) {
-        result.try_reserve(1).map_err(|_| SystemError::ENOMEM)?;
-        result.push(RouteEntry {
-            destination: IpCidr::Ipv6(Ipv6Cidr::new(
-                smoltcp::wire::Ipv6Address::from([
-                    0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                ]),
-                8,
-            )),
-            source: None,
-            preferred_source: None,
-            table: RT_TABLE_LOCAL,
-            priority: 256,
-            tos: 0,
-            protocol: RTPROT_KERNEL,
-            scope: RT_SCOPE_UNIVERSE,
-            kind: RTN_MULTICAST,
-            oif: iface.nic_id() as u32,
-            gateway: None,
-            nexthop_flags: 0,
-            ipv6_address_local: false,
-            ipv6_metadata: None,
-        });
-    }
     let addresses_with_metadata = addresses
         .iter()
         .copied()
@@ -888,14 +896,7 @@ pub(super) fn apply_automatic_ipv6_route_edit(
     netns: &Arc<NetNamespace>,
     plan: impl FnOnce(&FibTable) -> FibEdit,
 ) -> Result<FibEdit, SystemError> {
-    // RTNL keeps the edit stable until projection and FIB publication.
-    let edit = plan(&netns.router().fib.read());
-    if matches!(edit, FibEdit::None) {
-        return Ok(edit);
-    }
-    transact_single(rtnl, netns, |_| {
-        Ok(PlannedFibMutation { edit, outcome: () })
-    })?;
+    let edit = commit_automatic_ipv6_route_edit(rtnl, netns, plan)?;
     match edit {
         FibEdit::Insert { route, .. } => notify_automatic_ipv6_route(netns, route, false, false),
         FibEdit::Delete { route, .. } => notify_automatic_ipv6_route(netns, route, true, false),
@@ -904,6 +905,22 @@ pub(super) fn apply_automatic_ipv6_route_edit(
         }
         _ => {}
     }
+    Ok(edit)
+}
+
+fn commit_automatic_ipv6_route_edit(
+    rtnl: &RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    plan: impl FnOnce(&FibTable) -> FibEdit,
+) -> Result<FibEdit, SystemError> {
+    // RTNL keeps the edit stable until projection and FIB publication.
+    let edit = plan(&netns.router().fib.read());
+    if matches!(edit, FibEdit::None) {
+        return Ok(edit);
+    }
+    transact_single(rtnl, netns, |_| {
+        Ok(PlannedFibMutation { edit, outcome: () })
+    })?;
     Ok(edit)
 }
 

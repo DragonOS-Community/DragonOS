@@ -93,6 +93,7 @@ pub(crate) struct LinkMutationCommit {
     pub changed_addresses: Vec<smoltcp::wire::IpCidr>,
     pub removed_addresses: Vec<AddressInfo>,
     pub route_changes: Option<RouteNotifications>,
+    pub multicast_route: Option<route::RouteEntry>,
     pub removed_neighbors: Vec<NeighborEntry>,
     pub rename_old_devpath: Option<String>,
     /// At most one master bridge can be affected by a veth MTU mutation.
@@ -169,6 +170,17 @@ pub(crate) fn prepare_auto_mtu<'rtnl>(
     Ok(PreparedAutoMtu(plan))
 }
 
+/// Apply settings while creation may still roll back the unannounced link.
+pub(crate) fn configure_new_link(
+    rtnl: &RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    update: LinkUpdate,
+) -> Result<(), SystemError> {
+    PreparedLinkMutation::prepare(rtnl, netns.clone(), iface.clone(), update, None)?.commit()?;
+    Ok(())
+}
+
 pub(crate) fn mutate_link(
     rtnl: &RtnlGuard,
     netns: &Arc<NetNamespace>,
@@ -197,11 +209,25 @@ pub(crate) fn mutate_link(
     } else {
         None
     };
+    let initialize_multicast = !prepared.was_up && prepared.is_up
+        || prepared.mtu.is_some_and(|mtu| {
+            !prepared.iface.common().ipv6_device_present()
+                && prepared.iface.common().ipv6_device_present_at(mtu)
+        });
     let mut committed = prepared.commit()?;
     if let (Some(bridge_update), Some(mut slot)) = (bridge_update, related_slot) {
         slot.as_mut().write(bridge_update.commit());
         // SAFETY: the prepared bridge commit was written into the boxed slot.
         committed.related = Some(unsafe { slot.assume_init() });
+    }
+    // The link and any related bridge FIB candidates are fully published now.
+    // A ready device installs its automatic route before the link ACK.
+    if initialize_multicast {
+        committed.multicast_route = super::address::ipv6_autoconf::initialize_ready_multicast_route(
+            rtnl,
+            netns,
+            committed.iface.as_ref(),
+        );
     }
     Ok(committed)
 }
@@ -499,6 +525,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             changed_addresses,
             removed_addresses,
             route_changes,
+            multicast_route: None,
             removed_neighbors,
             rename_old_devpath,
             related: None,

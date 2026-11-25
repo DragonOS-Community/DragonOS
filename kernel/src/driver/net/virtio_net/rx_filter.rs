@@ -3,12 +3,15 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use smoltcp::{config, iface::Interface};
+use smoltcp::iface::Interface;
 use system_error::SystemError;
 use virtio_drivers::device::net::RxFilterCommand;
 
 use crate::{
-    driver::{net::types::InterfaceFlags, virtio::virtio_drivers_error_to_system_error},
+    driver::{
+        net::{types::InterfaceFlags, PacketMacMembership},
+        virtio::virtio_drivers_error_to_system_error,
+    },
     exception::workqueue::{schedule_work, Work},
     libs::{mutex::Mutex, spinlock::SpinLock},
     time::{
@@ -19,50 +22,79 @@ use crate::{
 
 use super::VirtIONicDeviceInner;
 
-const MAX_GROUPS: usize =
-    config::IFACE_MAX_ADDR_COUNT + config::IFACE_MAX_MULTICAST_GROUP_COUNT + 3;
+// A bounded projection keeps the control path allocation-free. If the
+// subscriptions do not fit, widen reception for that address class.
+const MAX_FILTER_ENTRIES: usize = 64;
 const COMMAND_TIMEOUT_US: i64 = 100_000;
 const COMMAND_POLL_NS: i64 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GroupTable {
-    entries: [[u8; 6]; MAX_GROUPS],
+struct MacEntries {
+    addresses: [[u8; 6]; MAX_FILTER_ENTRIES],
     count: usize,
+    overflow: bool,
 }
 
-impl GroupTable {
-    fn capture(interface: &Interface) -> Self {
-        let mut table = Self {
-            entries: [[0; 6]; MAX_GROUPS],
+impl MacEntries {
+    const fn new() -> Self {
+        Self {
+            addresses: [[0; 6]; MAX_FILTER_ENTRIES],
             count: 0,
-        };
-        interface.for_each_multicast_ethernet_address(|address| {
-            if !table.entries().contains(&address.0) {
-                table.entries[table.count] = address.0;
-                table.count += 1;
-            }
-        });
-        table
+            overflow: false,
+        }
     }
 
-    fn entries(&self) -> &[[u8; 6]] {
-        &self.entries[..self.count]
+    fn insert(&mut self, address: [u8; 6]) {
+        if self.overflow || self.addresses().contains(&address) {
+            return;
+        }
+        if let Some(entry) = self.addresses.get_mut(self.count) {
+            *entry = address;
+            self.count += 1;
+        } else {
+            self.overflow = true;
+        }
     }
+
+    fn addresses(&self) -> &[[u8; 6]] {
+        &self.addresses[..self.count]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MacTable {
+    unicast: MacEntries,
+    multicast: MacEntries,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RxMode {
     promiscuous: Option<bool>,
     all_multicast: Option<bool>,
-    groups: Option<GroupTable>,
+    mac_table: Option<MacTable>,
 }
 
 impl RxMode {
-    fn capture(interface: &Interface, flags: InterfaceFlags) -> Self {
+    fn capture(
+        interface: &Interface,
+        flags: InterfaceFlags,
+        packet_macs: &[(PacketMacMembership, u32)],
+    ) -> Self {
+        let mut multicast = MacEntries::new();
+        let mut unicast = MacEntries::new();
+        interface.for_each_multicast_ethernet_address(|address| multicast.insert(address.0));
+        for (member, _) in packet_macs {
+            let table = if member.multicast {
+                &mut multicast
+            } else {
+                &mut unicast
+            };
+            table.insert(member.address.0);
+        }
         Self {
-            promiscuous: Some(flags.contains(InterfaceFlags::PROMISC)),
-            all_multicast: Some(flags.contains(InterfaceFlags::ALLMULTI)),
-            groups: Some(GroupTable::capture(interface)),
+            promiscuous: Some(flags.contains(InterfaceFlags::PROMISC) || unicast.overflow),
+            all_multicast: Some(flags.contains(InterfaceFlags::ALLMULTI) || multicast.overflow),
+            mac_table: Some(MacTable { unicast, multicast }),
         }
     }
 }
@@ -96,8 +128,8 @@ impl RxFilter {
             }
         })?;
         let filter = self.clone();
-        let projector = Box::try_new(move |interface: &Interface, flags| {
-            let next = RxMode::capture(interface, flags);
+        let projector = Box::try_new(move |interface: &Interface, flags, packet_macs: &[_]| {
+            let next = RxMode::capture(interface, flags, packet_macs);
             let mut desired = filter.desired.lock_irqsave();
             if *desired == next {
                 return;
@@ -191,9 +223,15 @@ impl RxFilter {
 
     fn program(&self, applied: &mut RxMode, target: RxMode) -> Result<(), SystemError> {
         // Fill the table before narrowing reception, including after detach.
-        if let Some(groups) = target.groups.filter(|_| applied.groups != target.groups) {
-            self.command(RxFilterCommand::MulticastTable(groups.entries()))?;
-            applied.groups = Some(groups);
+        if let Some(table) = target
+            .mac_table
+            .filter(|_| applied.mac_table != target.mac_table)
+        {
+            self.command(RxFilterCommand::MacTable {
+                unicast: table.unicast.addresses(),
+                multicast: table.multicast.addresses(),
+            })?;
+            applied.mac_table = Some(table);
         }
         if let Some(enabled) = target
             .all_multicast

@@ -5,7 +5,8 @@ use alloc::boxed::Box;
 use smoltcp::iface::{IpIngressFilter, PollIngressSingleResult, PollResult};
 
 pub(crate) type InterfaceSocketSet = Arc<Mutex<smoltcp::iface::SocketSet<'static, 'static>>>;
-pub(super) type ReceiveFilter = dyn Fn(&smoltcp::iface::Interface, InterfaceFlags) + Send + Sync;
+pub(super) type ReceiveFilter =
+    dyn Fn(&smoltcp::iface::Interface, InterfaceFlags, &[(PacketMacMembership, u32)]) + Send + Sync;
 
 fn poll_smol<D: SmolDevice + ?Sized>(
     interface: &mut smoltcp::iface::Interface,
@@ -319,6 +320,7 @@ impl IfaceCommon {
                 packet_promiscuity: 0,
                 packet_allmulti: 0,
                 bridge_receive: false,
+                packet_macs: Vec::new(),
             }),
         }
     }
@@ -333,7 +335,8 @@ impl IfaceCommon {
     /// serialize hardware projection with address and membership updates.
     pub(crate) fn sync_receive_filter(&self, iface: &smoltcp::iface::Interface) {
         if let Some(filter) = &self.receive_filter {
-            filter(iface, self.flags());
+            let mode = self.receive_mode.lock();
+            filter(iface, self.flags(), &mode.packet_macs);
         }
     }
 
@@ -2462,6 +2465,48 @@ impl IfaceCommon {
         if self.release_configured_neighbor(ifindex, next_hop) {
             self.schedule_registered_local_output(crate::time::Instant::now().into());
         }
+    }
+
+    pub(crate) fn adjust_packet_mac(
+        &self,
+        address: smoltcp::wire::EthernetAddress,
+        multicast: bool,
+        inc: i32,
+    ) -> Result<(), SystemError> {
+        if self.receive_filter.is_none() {
+            return Ok(());
+        }
+        let mut mode = self.receive_mode.lock();
+        let membership = PacketMacMembership { address, multicast };
+        let existing = mode
+            .packet_macs
+            .iter()
+            .position(|(key, _)| *key == membership);
+        match (inc, existing) {
+            (1, Some(index)) => {
+                let count = &mut mode.packet_macs[index].1;
+                *count = count.checked_add(1).ok_or(SystemError::EOVERFLOW)?;
+                return Ok(());
+            }
+            (1, None) => {
+                mode.packet_macs
+                    .try_reserve(1)
+                    .map_err(|_| SystemError::ENOBUFS)?;
+                mode.packet_macs.push((membership, 1));
+            }
+            (-1, Some(index)) => {
+                let count = &mut mode.packet_macs[index].1;
+                *count -= 1;
+                if *count != 0 {
+                    return Ok(());
+                }
+                mode.packet_macs.remove(index);
+            }
+            _ => return Err(SystemError::EINVAL),
+        }
+        drop(mode);
+        self.sync_receive_filter(&self.smol_iface.lock());
+        Ok(())
     }
 
     pub fn adjust_promiscuity(&self, inc: i32) -> Result<(), SystemError> {

@@ -1015,13 +1015,17 @@ fn rx_filter_serializes_commands_and_reports_device_refusal() {
     overwrite_completion_slot(&state, 2, 0, None, Some(1));
     assert_eq!(net.poll_rx_filter(), Ok(Some(false)));
 
+    let unicast = [[0x02, 0, 0, 0, 0, 2]];
     let multicast = [[0x33, 0x33, 0, 0, 0, 1]];
-    net.start_rx_filter(RxFilterCommand::MulticastTable(&multicast))
-        .unwrap();
+    net.start_rx_filter(RxFilterCommand::MacTable {
+        unicast: &unicast,
+        multicast: &multicast,
+    })
+    .unwrap();
     state.lock().unwrap().read_write_queue::<2>(2, |request| {
         assert_eq!(
             request,
-            [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0x33, 0x33, 0, 0, 0, 1]
+            [1, 0, 1, 0, 0, 0, 0x02, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0x33, 0x33, 0, 0, 0, 1]
         );
         vec![0]
     });

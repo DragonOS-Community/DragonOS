@@ -881,6 +881,11 @@ pub trait Iface: crate::driver::base::device::Device {
     /// released FIB, smoltcp and data-path locks.
     fn sync_receive_filter_after_link_change(&self) {}
 
+    /// Whether AF_PACKET address memberships feed this device's MAC filter.
+    fn supports_packet_mac_filter(&self) -> bool {
+        false
+    }
+
     /// # 获取当前iface的napi结构体
     /// 默认返回None，表示不支持napi
     fn napi_struct(&self) -> Option<Arc<napi::NapiStruct>> {
@@ -1087,12 +1092,19 @@ pub(crate) fn prepare_unregister_netdevices_from_locked<'rtnl>(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PacketMacMembership {
+    pub address: smoltcp::wire::EthernetAddress,
+    pub multicast: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct ReceiveModeState {
     pub(super) configured_flags: u32,
     pub(super) packet_promiscuity: u32,
     pub(super) packet_allmulti: u32,
     pub(super) bridge_receive: bool,
+    pub(super) packet_macs: Vec<(PacketMacMembership, u32)>,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -11,8 +11,13 @@ pub enum RxFilterCommand<'a> {
     Promiscuous(bool),
     /// Enable or disable acceptance of all multicast destination MACs.
     AllMulticast(bool),
-    /// Replace the additional multicast MAC filter. The unicast list is empty.
-    MulticastTable(&'a [EthernetAddress]),
+    /// Replace the additional unicast and multicast MAC filters.
+    MacTable {
+        /// Additional unicast destinations.
+        unicast: &'a [EthernetAddress],
+        /// Additional multicast destinations.
+        multicast: &'a [EthernetAddress],
+    },
 }
 
 // A single RX/TX queue pair occupies indices zero and one.
@@ -69,21 +74,18 @@ impl<H: Hal> ControlQueue<H> {
                 buffer[..3].copy_from_slice(&[0, 1, u8::from(enable)]);
                 3
             }
-            RxFilterCommand::MulticastTable(addresses) => {
+            RxFilterCommand::MacTable { unicast, multicast } => {
                 const HEADER_LEN: usize = 10;
-                if addresses.len() > (PAGE_SIZE - HEADER_LEN - 1) / 6 {
-                    return Err(Error::InvalidParam);
-                }
+                let count = unicast
+                    .len()
+                    .checked_add(multicast.len())
+                    .filter(|count| *count <= (PAGE_SIZE - HEADER_LEN - 1) / 6)
+                    .ok_or(Error::InvalidParam)?;
                 buffer[..2].copy_from_slice(&[1, 0]);
-                buffer[2..6].fill(0); // Additional unicast address count.
-                buffer[6..HEADER_LEN].copy_from_slice(&(addresses.len() as u32).to_le_bytes());
-                let length = HEADER_LEN + addresses.len() * 6;
-                for (entry, address) in buffer[HEADER_LEN..length]
-                    .chunks_exact_mut(6)
-                    .zip(addresses)
-                {
-                    entry.copy_from_slice(address);
-                }
+                let middle = 6 + unicast.len() * 6;
+                let length = HEADER_LEN + count * 6;
+                encode_mac_list(&mut buffer[2..middle], unicast);
+                encode_mac_list(&mut buffer[middle..length], multicast);
                 length
             }
         };
@@ -138,5 +140,12 @@ impl<H: Hal> ControlQueue<H> {
                     .expect("pending control token is valid");
             }
         }
+    }
+}
+
+fn encode_mac_list(bytes: &mut [u8], addresses: &[EthernetAddress]) {
+    bytes[..4].copy_from_slice(&(addresses.len() as u32).to_le_bytes());
+    for (entry, address) in bytes[4..].chunks_exact_mut(6).zip(addresses) {
+        entry.copy_from_slice(address);
     }
 }

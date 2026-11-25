@@ -407,7 +407,7 @@ impl E1000EInterface {
                 flags,
                 iface,
             )
-            .with_receive_filter(Box::new(move |interface, flags| {
+            .with_receive_filter(Box::new(move |interface, flags, _| {
                 filter_driver.sync_receive_filter(interface, flags);
             })),
             inner: SpinLock::new(InnerE1000EInterface {

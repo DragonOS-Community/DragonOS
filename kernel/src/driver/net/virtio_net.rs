@@ -1646,6 +1646,10 @@ impl Iface for VirtioInterface {
         self.bridge_port.advance_generation();
     }
 
+    fn supports_packet_mac_filter(&self) -> bool {
+        self.rx_filter.is_some()
+    }
+
     fn sync_receive_filter_after_link_change(&self) {
         if let Some(filter) = &self.rx_filter {
             filter.synchronize_link(self.flags().contains(InterfaceFlags::UP));

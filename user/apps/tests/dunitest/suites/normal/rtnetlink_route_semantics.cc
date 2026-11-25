@@ -1447,13 +1447,15 @@ struct Ipv6RuleRecord {
 };
 
 int ChangeIpv6Rule(int fd, uint16_t kind, uint32_t sequence, uint32_t priority,
-                   uint32_t table, const char* source = nullptr, uint8_t source_length = 0) {
+                   uint32_t table, const char* source = nullptr, uint8_t source_length = 0,
+                   uint32_t* echo_group = nullptr) {
     alignas(nlmsghdr) char buffer[128]{};
     auto* header = reinterpret_cast<nlmsghdr*>(buffer);
     header->nlmsg_len = NLMSG_LENGTH(sizeof(fib_rule_hdr));
     header->nlmsg_type = kind;
     header->nlmsg_seq = sequence;
     header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    if (echo_group != nullptr) header->nlmsg_flags |= NLM_F_ECHO;
     if (kind == RTM_NEWRULE) header->nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
     auto* body = static_cast<fib_rule_hdr*>(NLMSG_DATA(header));
     body->family = AF_INET6;
@@ -1469,6 +1471,17 @@ int ChangeIpv6Rule(int fd, uint16_t kind, uint32_t sequence, uint32_t priority,
         AddAttr(header, sizeof(buffer), FRA_SRC, &address, sizeof(address));
     }
     if (send(fd, header, header->nlmsg_len, 0) < 0) return errno;
+    if (echo_group != nullptr) {
+        sockaddr_nl peer{};
+        socklen_t peer_size = sizeof(peer);
+        int length = static_cast<int>(recvfrom(fd, buffer, sizeof(buffer), 0,
+                                               reinterpret_cast<sockaddr*>(&peer), &peer_size));
+        if (length < 0) return errno;
+        if (!NLMSG_OK(header, length) || header->nlmsg_seq != sequence ||
+            header->nlmsg_type != kind || peer_size != sizeof(peer) || peer.nl_pid != 0)
+            return EPROTO;
+        *echo_group = peer.nl_groups;
+    }
     return RecvAck(fd, sequence);
 }
 
@@ -1542,6 +1555,16 @@ TEST(RtnetlinkRouteSemantics, Ipv6PolicyRulesKeepStableOrderAndNotify) {
             EXPECT_EQ((*rules)[0].table, static_cast<uint32_t>(RT_TABLE_LOCAL));
             EXPECT_EQ((*rules)[0].protocol, RTPROT_KERNEL);
             EXPECT_EQ((*rules)[1].priority, 32766u);
+
+            constexpr uint32_t rule_group = 1u << (RTNLGRP_IPV6_RULE - 1);
+            uint32_t echo_group = 0;
+            ASSERT_EQ(ChangeIpv6Rule(fd.Get(), RTM_NEWRULE, ++sequence, 73, 173, nullptr, 0,
+                                     &echo_group), 0);
+            EXPECT_EQ(echo_group, rule_group);
+            EXPECT_EQ(ReceiveNotificationType(listener.Get()), RTM_NEWRULE);
+            ASSERT_EQ(ChangeIpv6Rule(listener.Get(), RTM_DELRULE, ++sequence, 73, 173, nullptr, 0,
+                                     &echo_group), 0);
+            EXPECT_EQ(echo_group, rule_group);
 
             constexpr char source[] = "fd73:2::a";
             EXPECT_EQ(ChangeIpv6Rule(fd.Get(), RTM_NEWRULE, ++sequence, 74, 173, nullptr, 64),

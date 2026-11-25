@@ -18,7 +18,7 @@ use crate::{
                         rule::{RuleAttr, RuleSegment, RuleSegmentBody},
                         RouteNlSegment,
                     },
-                    RouteNlMessage,
+                    RouteNlMessage, RouteNlPacket,
                 },
                 table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
             },
@@ -28,7 +28,7 @@ use crate::{
     process::namespace::net_namespace::NetNamespace,
 };
 
-use super::{deliver_response, utils::multicast_notify_excluding, RtnlRequestContext};
+use super::RtnlRequestContext;
 
 const FR_ACT_TO_TBL: u8 = 1;
 const RTNLGRP_IPV6_RULE: u32 = 19;
@@ -114,26 +114,34 @@ fn notify_change(
     let echo =
         SegHdrCommonFlags::from_bits_truncate(request.flags).contains(SegHdrCommonFlags::ECHO);
     let excluded = if echo { port } else { 0 };
-    match rule_segment(header, kind, applied) {
-        Ok(segment) => {
-            multicast_notify_excluding(netns.clone(), RTMGRP_IPV6_RULE, excluded, segment)
-        }
+    let packet = (|| {
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(1)
+            .map_err(|_| SystemError::ENOMEM)?;
+        segments.push(rule_segment(header, kind, applied)?);
+        RouteNlPacket::notification(&RouteNlMessage::new(segments), RTMGRP_IPV6_RULE)
+    })();
+    let packet = match packet {
+        Ok(packet) => packet,
         Err(_) => {
-            NetlinkRouteProtocol::report_group_overrun(RTNLGRP_IPV6_RULE, excluded, netns.clone())
-        }
-    }
-    if echo {
-        let mut reply = Vec::new();
-        match (
-            reply.try_reserve_exact(1),
-            rule_segment(header, kind, applied),
-        ) {
-            (Ok(()), Ok(segment)) => {
-                reply.push(segment);
-                deliver_response(port, RouteNlMessage::new(reply), netns);
+            if echo {
+                NetlinkRouteProtocol::report_overrun(port, netns.clone());
             }
-            _ => NetlinkRouteProtocol::report_overrun(port, netns),
+            NetlinkRouteProtocol::report_group_overrun(RTNLGRP_IPV6_RULE, excluded, netns);
+            return;
         }
+    };
+    if echo {
+        NetlinkRouteProtocol::notify_group(
+            RTNLGRP_IPV6_RULE,
+            excluded,
+            packet.clone(),
+            netns.clone(),
+        );
+        let _ = NetlinkRouteProtocol::unicast(port, packet, netns);
+    } else {
+        NetlinkRouteProtocol::notify_group(RTNLGRP_IPV6_RULE, excluded, packet, netns);
     }
 }
 

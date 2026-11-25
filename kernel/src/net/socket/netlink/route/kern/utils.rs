@@ -31,24 +31,11 @@ pub fn kernel_notify_header(type_: CSegmentType) -> CMsgSegHdr {
 }
 
 pub fn multicast_notify(netns: Arc<NetNamespace>, group_mask: u32, segment: RouteNlSegment) {
-    multicast_notify_excluding(netns, group_mask, 0, segment);
-}
-
-pub(super) fn multicast_notify_excluding(
-    netns: Arc<NetNamespace>,
-    group_mask: u32,
-    excluded_port: u32,
-    segment: RouteNlSegment,
-) {
     let groups = GroupIdSet::new(group_mask);
     let mut segments = Vec::new();
     if segments.try_reserve_exact(1).is_err() {
         for group_index in groups.ids_iter() {
-            NetlinkRouteProtocol::report_group_overrun(
-                group_index + 1,
-                excluded_port,
-                netns.clone(),
-            );
+            NetlinkRouteProtocol::report_group_overrun(group_index + 1, 0, netns.clone());
         }
         return;
     }
@@ -57,12 +44,8 @@ pub(super) fn multicast_notify_excluding(
     for group_index in groups.ids_iter() {
         let group_id = group_index + 1;
         match RouteNlPacket::notification(&message, 1 << group_index) {
-            Ok(packet) => {
-                NetlinkRouteProtocol::notify_group(group_id, excluded_port, packet, netns.clone())
-            }
-            Err(_) => {
-                NetlinkRouteProtocol::report_group_overrun(group_id, excluded_port, netns.clone())
-            }
+            Ok(packet) => NetlinkRouteProtocol::notify_group(group_id, 0, packet, netns.clone()),
+            Err(_) => NetlinkRouteProtocol::report_group_overrun(group_id, 0, netns.clone()),
         }
     }
 }

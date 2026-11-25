@@ -2378,6 +2378,17 @@ impl<'a> Socket<'a> {
         self.tx_buffer.len()
     }
 
+    /// Total unsent bytes if the peer window allows any new payload.
+    pub fn unsent_bytes_if_window_open(&self) -> usize {
+        let end = self.local_seq_no + self.tx_buffer.len();
+        let next = self.send_sequence_end();
+        if next < end && next < self.local_seq_no + self.remote_win_len {
+            end - next
+        } else {
+            0
+        }
+    }
+
     /// Return the amount of octets queued in the receive buffer. This value can be larger than
     /// the slice read by the next `recv` or `peek` call because it includes all queued octets,
     /// and not only the octets that may be returned as a contiguous slice.

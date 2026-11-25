@@ -1025,102 +1025,69 @@ impl TcpSocket {
     }
 
     fn try_send_direct(&self, buf: &[u8], urgent_end: Option<usize>) -> Result<usize, SystemError> {
-        // TODO: add nonblock check of connecting socket
-        //
-        // IMPORTANT: to avoid "all sleepers, no pollers" stalls on loopback (gVisor BlockingLargeSend),
-        // we must ensure the protocol stack is progressed:
-        // - poll BEFORE sending: to drain acks/advance state and make more send capacity available
-        // - poll AFTER sending: to actually transmit queued segments and process immediate loopback delivery
-        // Additionally, wake the netns poll thread so timers/retransmits can progress even if callers sleep.
-        let maybe_iface = self.stack_poll_snapshot();
-        if let Some(iface) = maybe_iface.as_ref() {
-            if let Some(netns) = iface.net_namespace() {
-                netns.wakeup_tcp_poll();
+        let result = {
+            let inner = self.inner.read();
+            match inner.as_ref() {
+                Some(inner::Inner::Established(est)) => Some(
+                    est.send_slice(buf, urgent_end)
+                        .map(|accepted| (accepted, est.stack().clone())),
+                ),
+                _ => None,
             }
-            // Loopback / fast-path correctness:
-            // Poll once may only enqueue TX (or only process RX) without completing the
-            // loopback roundtrip (TX->RX->ACK). If we return EAGAIN too early here,
-            // acks processed shortly afterwards can free send buffer and make POLLOUT
-            // appear spuriously (gVisor PollWithFullBufferBlocks).
-            super::poll_util::poll_stack_batch(iface.as_ref());
-        }
+        };
 
-        // Fast path: Established.
-        // NOTE: do not early-return while holding any lock; we may need to poll after send.
-        let mut result: Option<Result<usize, SystemError>> = None;
-        {
-            let inner_guard = self.inner.read();
-            if let Some(inner::Inner::Established(est)) = inner_guard.as_ref() {
-                result = Some(est.send_slice(buf, urgent_end));
-            }
+        // Established writes with space can queue data without waiting for a
+        // namespace poll. Publish the work after releasing the socket locks.
+        let (accepted, stack) = match result {
+            Some(result) => result?,
+            None => self.try_send_after_connect(buf, urgent_end)?,
+        };
+        if accepted != 0 {
+            stack.request_poll();
         }
-        if let Some(ret) = result {
-            if let Some(iface) = maybe_iface.as_ref() {
-                if let Some(netns) = iface.net_namespace() {
-                    netns.wakeup_tcp_poll();
-                }
-                super::poll_util::poll_stack_batch(iface.as_ref());
-            }
-            return ret;
-        }
+        Ok(accepted)
+    }
 
-        // Handle transition from Connecting to Established
+    fn try_send_after_connect(
+        &self,
+        buf: &[u8],
+        urgent_end: Option<usize>,
+    ) -> Result<(usize, alloc::sync::Arc<crate::net::tcp_stack::TcpStack>), SystemError> {
         let mut writer = self.inner.write();
-        if let Some(inner) = writer.take() {
-            let ret = match inner {
-                inner::Inner::Connecting(conn) => {
-                    // A background flush may observe a failed connect, but
-                    // must not consume its result or replace its owner state.
-                    if !conn.is_connected() {
-                        let error = if conn.failure_reason().is_some() || conn.is_refused_consumed()
-                        {
-                            SystemError::EPIPE
-                        } else {
-                            SystemError::EAGAIN_OR_EWOULDBLOCK
-                        };
-                        writer.replace(inner::Inner::Connecting(conn));
-                        return Err(error);
-                    }
-                    let (new_inner, res) = conn.into_result();
-                    match new_inner {
-                        inner::Inner::Established(est) => {
-                            let r = est.send_slice(buf, urgent_end);
-                            writer.replace(inner::Inner::Established(est));
-                            r
-                        }
-                        other => {
-                            writer.replace(other);
-                            // If connection failed, return error (EPIPE or EAGAIN if still connecting)
-                            match res {
-                                Ok(_) => Err(SystemError::EAGAIN_OR_EWOULDBLOCK), // Should be Established if Ok
-                                Err(e) => Err(e),
-                            }
-                        }
-                    }
-                }
-                inner::Inner::Established(est) => {
-                    let r = est.send_slice(buf, urgent_end);
-                    writer.replace(inner::Inner::Established(est));
-                    r
-                }
-                other => {
-                    writer.replace(other);
-                    Err(SystemError::EPIPE)
-                }
+        if matches!(writer.as_ref(), Some(inner::Inner::Connecting(_))) {
+            let Some(inner::Inner::Connecting(conn)) = writer.take() else {
+                unreachable!();
             };
-
-            // Drop lock before polling to avoid lock-order inversion with iface.poll()->notify().
-            drop(writer);
-            if let Some(iface) = maybe_iface.as_ref() {
-                if let Some(netns) = iface.net_namespace() {
-                    netns.wakeup_tcp_poll();
-                }
-                super::poll_util::poll_stack_batch(iface.as_ref());
+            // A background cork flush must leave a failed connect result
+            // available to the user-facing error boundary.
+            if !conn.is_connected() {
+                let error = if conn.failure_reason().is_some() || conn.is_refused_consumed() {
+                    SystemError::EPIPE
+                } else {
+                    SystemError::EAGAIN_OR_EWOULDBLOCK
+                };
+                writer.replace(inner::Inner::Connecting(conn));
+                return Err(error);
             }
-            return ret;
+            let (connected, result) = conn.into_result();
+            let established = matches!(connected, inner::Inner::Established(_));
+            writer.replace(connected);
+            if !established {
+                return Err(if result.is_ok() {
+                    SystemError::EAGAIN_OR_EWOULDBLOCK
+                } else {
+                    SystemError::EPIPE
+                });
+            }
         }
 
-        Err(SystemError::ENOTCONN)
+        match writer.as_ref() {
+            Some(inner::Inner::Established(est)) => est
+                .send_slice(buf, urgent_end)
+                .map(|accepted| (accepted, est.stack().clone())),
+            Some(_) => Err(SystemError::EPIPE),
+            None => Err(SystemError::ENOTCONN),
+        }
     }
 }
 

@@ -173,7 +173,15 @@ impl TcpSocket {
         }
 
         if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
-            let ret = self.try_send(buffer, flags, report_error);
+            let mut ret = self.try_send(buffer, flags, report_error);
+            // Drain pending ACKs before reporting a full loopback send buffer,
+            // so the caller does not immediately see a stale POLLOUT transition.
+            if ret == Err(SystemError::EAGAIN_OR_EWOULDBLOCK) {
+                if let Some(stack) = self.stack_poll_snapshot() {
+                    poll_util::poll_stack_batch(stack.as_ref());
+                    ret = self.try_send(buffer, flags, report_error);
+                }
+            }
             if let Ok(n) = ret {
                 if n > 0 {
                     self.notify();

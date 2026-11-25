@@ -952,6 +952,36 @@ impl TcpSocket {
 
     pub fn close_socket(&self) -> Result<(), SystemError> {
         let mut writer = self.inner.write();
+        if let Some(inner::Inner::Established(socket)) = writer.as_ref() {
+            let mut pending = socket.with(|tcp| {
+                if tcp.recv_queue() != 0 || self.should_abort_established_zero_linger(tcp.state()) {
+                    tcp.unsent_bytes_if_window_open()
+                } else {
+                    0
+                }
+            });
+            if pending != 0 {
+                let stack = socket.stack().clone();
+
+                // An abort purges the transmit queue. Give already queued
+                // bytes an output opportunity. Continue only while this
+                // socket admits new payload, independent of window updates.
+                for _ in 0..super::poll_util::STACK_POLL_BATCH_ROUNDS {
+                    drop(writer);
+                    let _ = stack.poll();
+                    writer = self.inner.write();
+                    let Some(inner::Inner::Established(socket)) = writer.as_ref() else {
+                        break;
+                    };
+                    let remaining = socket.with(|tcp| tcp.unsent_bytes_if_window_open());
+                    if remaining == 0 || remaining >= pending {
+                        break;
+                    }
+                    pending = remaining;
+                }
+            }
+        }
+
         let Some(inner) = writer.take() else {
             log::warn!("TcpSocket::close: already closed, unexpected");
             return Ok(());

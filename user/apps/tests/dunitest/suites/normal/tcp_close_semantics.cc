@@ -603,6 +603,50 @@ TEST(TcpCloseSemantics, ZeroLingerDoesNotOvertakeSentDualStackData) {
     }
 }
 
+TEST(TcpCloseSemantics, AbortiveCloseDoesNotOvertakeQueuedResponse) {
+    for (bool unread_request : {false, true}) {
+        SCOPED_TRACE(unread_request);
+        TcpPair pair;
+        ASSERT_TRUE(InitTcpPair(&pair));
+        if (unread_request) {
+            constexpr char request[] = "request";
+            ASSERT_EQ(static_cast<ssize_t>(sizeof(request)),
+                      write(pair.client_fd.Get(), request, sizeof(request)));
+            pollfd pending{.fd = pair.server_fd.Get(), .events = POLLIN, .revents = 0};
+            ASSERT_EQ(1, poll(&pending, 1, 1000));
+            ASSERT_NE(0, pending.revents & POLLIN);
+        } else {
+            const linger abortive{.l_onoff = 1, .l_linger = 0};
+            ASSERT_EQ(0, setsockopt(pair.server_fd.Get(), SOL_SOCKET, SO_LINGER,
+                                    &abortive, sizeof(abortive)));
+        }
+
+        // Verify that a short response on this established loopback
+        // connection reaches the peer before the abortive close.
+        char response[1000];
+        std::memset(response, 'r', sizeof(response));
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(response)),
+                  write(pair.server_fd.Get(), response, sizeof(response)));
+        ASSERT_EQ(0, close(pair.server_fd.Release()));
+
+        const timeval deadline{.tv_sec = 2, .tv_usec = 0};
+        ASSERT_EQ(0, setsockopt(pair.client_fd.Get(), SOL_SOCKET, SO_RCVTIMEO,
+                                &deadline, sizeof(deadline)));
+        char received[sizeof(response)] = {};
+        size_t total = 0;
+        while (total < sizeof(received)) {
+            const ssize_t n =
+                read(pair.client_fd.Get(), received + total, sizeof(received) - total);
+            ASSERT_GT(n, 0) << ErrnoString(errno);
+            total += static_cast<size_t>(n);
+        }
+        EXPECT_EQ(0, std::memcmp(response, received, sizeof(received)));
+        char extra;
+        ASSERT_EQ(-1, read(pair.client_fd.Get(), &extra, sizeof(extra)));
+        EXPECT_EQ(ECONNRESET, errno);
+    }
+}
+
 TEST(TcpCloseSemantics, ShutdownWrThenUnreadDataCloseAborts) {
     signal(SIGPIPE, SIG_IGN);
     TcpPair pair;

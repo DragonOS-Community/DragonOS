@@ -233,7 +233,12 @@ impl PreparedNetnsBinding {
         let socket_set = common.sockets.read().clone();
         let mut sockets = socket_set.lock();
         let mut namespace = common.net_namespace.write();
-        common.inherit_ipv6_defaults(&self.netns);
+        common.inherit_ipv6_defaults(
+            &self.netns,
+            common
+                .flags()
+                .intersects(InterfaceFlags::NOARP | InterfaceFlags::LOOPBACK),
+        );
         common.route_localnet.store(0, Ordering::Release);
         *namespace = Arc::downgrade(&self.netns);
         sockets.set_udp_ingress_handler(Some(self.ingress));
@@ -2356,21 +2361,27 @@ impl IfaceCommon {
             .then(|| self.ipv6_device_generation.load(Ordering::Acquire))
     }
 
-    fn inherit_ipv6_defaults(&self, netns: &NetNamespace) {
+    fn inherit_ipv6_defaults(&self, netns: &NetNamespace, no_arp: bool) {
         self.ipv6_forwarding
             .store(netns.ipv6_default_forwarding(), Ordering::Release);
         self.ipv6_accept_ra
             .store(netns.ipv6_default_accept_ra(), Ordering::Release);
         let prefixes = *netns.ipv6_default_prefixes.lock();
+        let addresses =
+            crate::net::address::ipv6_autoconf::inherited_address_settings(netns, no_arp);
         let mut autoconf = self.ipv6_autoconf.lock();
         autoconf.prefixes = prefixes;
+        autoconf.address_settings = addresses;
         autoconf.keep_addr_on_down = netns.ipv6_default_keep_addr_on_down();
     }
 
     /// Renew IPv6 configuration before the link transaction exposes a usable MTU.
     pub(crate) fn restore_ipv6_device(&self, netns: &NetNamespace, noarp: bool) {
         crate::net::address::ipv6_autoconf::reset_device_state(self, noarp);
-        self.inherit_ipv6_defaults(netns);
+        self.inherit_ipv6_defaults(
+            netns,
+            noarp || self.flags().contains(InterfaceFlags::LOOPBACK),
+        );
         self.publish_ipv6_disabled(0);
         self.ipv6_device_generation.fetch_add(1, Ordering::Release);
     }

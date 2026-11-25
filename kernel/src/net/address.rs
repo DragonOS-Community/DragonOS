@@ -972,7 +972,7 @@ fn commit_published(
                 }
                 if let (IpCidr::Ipv6(ipv6), Some(false)) = (cidr, options.ipv6_nodad) {
                     if ipv6.address().x_is_unicast() {
-                        manual_probe = ipv6_autoconf::manual_dad_transmits(iface.as_ref())
+                        manual_probe = ipv6_autoconf::manual_dad_transmits(&netns, iface.as_ref())
                             .map(|transmits| (ipv6, transmits));
                     }
                 }

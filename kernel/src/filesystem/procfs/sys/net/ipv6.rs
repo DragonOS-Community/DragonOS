@@ -10,7 +10,10 @@ use crate::filesystem::{
     vfs::{file::FileFlags, FilePrivateData, IndexNode, InodeMode, PrimaryWriteResult},
 };
 use crate::libs::mutex::MutexGuard;
-use crate::net::{address::ipv6_autoconf::PrefixSetting, rtnl};
+use crate::net::{
+    address::ipv6_autoconf::{AddressSetting, PrefixSetting},
+    rtnl,
+};
 use alloc::{
     format,
     string::ToString,
@@ -180,6 +183,9 @@ impl DirOps for NamespaceConfDirOps {
             "accept_ra_pinfo" => NamespaceConfField::Prefix(PrefixSetting::AcceptRaPinfo),
             "autoconf" => NamespaceConfField::Prefix(PrefixSetting::Autoconf),
             "keep_addr_on_down" => NamespaceConfField::KeepAddrOnDown,
+            "addr_gen_mode" => NamespaceConfField::Address(AddressSetting::AddrGenMode),
+            "accept_dad" => NamespaceConfField::Address(AddressSetting::AcceptDad),
+            "dad_transmits" => NamespaceConfField::Address(AddressSetting::DadTransmits),
             _ => return Err(SystemError::ENOENT),
         };
         Ok(dir
@@ -209,6 +215,9 @@ impl DirOps for NamespaceConfDirOps {
         let _ = self.lookup_child(dir, "accept_ra_pinfo");
         let _ = self.lookup_child(dir, "autoconf");
         let _ = self.lookup_child(dir, "keep_addr_on_down");
+        let _ = self.lookup_child(dir, "addr_gen_mode");
+        let _ = self.lookup_child(dir, "accept_dad");
+        let _ = self.lookup_child(dir, "dad_transmits");
     }
 }
 
@@ -218,6 +227,7 @@ enum NamespaceConfField {
     AcceptRa,
     KeepAddrOnDown,
     Prefix(PrefixSetting),
+    Address(AddressSetting),
 }
 
 #[derive(Debug)]
@@ -282,6 +292,14 @@ impl FileOps for NamespaceConfFileOps {
                 (NamespaceConfField::KeepAddrOnDown, NamespaceConfScope::Default) => {
                     netns.set_ipv6_default_keep_addr_on_down(&rtnl, value);
                 }
+                (NamespaceConfField::Address(setting), scope) => {
+                    setting.write_scope(
+                        &rtnl,
+                        &netns,
+                        matches!(scope, NamespaceConfScope::All),
+                        value,
+                    )?;
+                }
                 (NamespaceConfField::Prefix(setting), NamespaceConfScope::All) => {
                     netns.ipv6_all_prefixes.lock().set(*setting, value);
                 }
@@ -324,6 +342,9 @@ impl FileOps for NamespaceConfFileOps {
             }
             (NamespaceConfField::KeepAddrOnDown, NamespaceConfScope::Default) => {
                 netns.ipv6_default_keep_addr_on_down()
+            }
+            (NamespaceConfField::Address(setting), scope) => {
+                setting.read_scope(&netns, matches!(scope, NamespaceConfScope::All))
             }
             (NamespaceConfField::Prefix(setting), NamespaceConfScope::All) => {
                 netns.ipv6_all_prefixes.lock().get(*setting)

@@ -4,6 +4,7 @@ use crate::{
     process::namespace::net_namespace::NetNamespace,
 };
 use alloc::sync::{Arc, Weak};
+use smoltcp::phy::{RouteCookie, EMPTY_ROUTE_COOKIE};
 
 pub(crate) mod bind;
 pub(crate) mod error_queue;
@@ -79,7 +80,7 @@ pub struct BoundInner {
 pub(crate) struct EphemeralBindTarget {
     pub(crate) stack_owner: Arc<dyn Iface>,
     pub(crate) local_addr: smoltcp::wire::IpAddress,
-    pub(crate) route_cookie: u64,
+    pub(crate) route_cookie: RouteCookie,
 }
 
 pub(crate) fn explicit_bind_iface(
@@ -458,7 +459,7 @@ pub(crate) fn ephemeral_target_for_source(
     Ok(EphemeralBindTarget {
         stack_owner,
         local_addr,
-        route_cookie: 0,
+        route_cookie: EMPTY_ROUTE_COOKIE,
     })
 }
 

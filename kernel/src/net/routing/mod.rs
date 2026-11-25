@@ -58,7 +58,15 @@ pub struct Router {
 pub(in crate::net) struct RouterFibWriteGuard<'a> {
     fib: RwSemWriteGuard<'a, crate::net::route::FibTable>,
     authoritative_output: &'a AtomicBool,
+    invalidate_pmtu: bool,
     pmtu: &'a crate::libs::spinlock::SpinLock<crate::net::route::pmtu::PmtuCache>,
+}
+
+impl RouterFibWriteGuard<'_> {
+    /// An edit that failed before publishing must keep existing exceptions.
+    pub(in crate::net) fn keep_pmtu(&mut self) {
+        self.invalidate_pmtu = false;
+    }
 }
 
 impl core::ops::Deref for RouterFibWriteGuard<'_> {
@@ -79,7 +87,9 @@ impl Drop for RouterFibWriteGuard<'_> {
     fn drop(&mut self) {
         // Publication invalidates route exceptions, including device/address
         // changes which retain the same prefix or reuse an interface index.
-        self.pmtu.lock().invalidate();
+        if self.invalidate_pmtu {
+            self.pmtu.lock().invalidate();
+        }
         self.authoritative_output
             .store(self.fib.requires_authoritative_output(), Ordering::Release);
     }
@@ -126,6 +136,7 @@ impl Router {
         RouterFibWriteGuard {
             fib,
             authoritative_output: &self.authoritative_output,
+            invalidate_pmtu: true,
             pmtu: &self.pmtu,
         }
     }

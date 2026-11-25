@@ -333,7 +333,8 @@ impl OutputBackendPolicy<'_> {
                 if route.oif == self.owner_ifindex
                     && self.owner_is_up
                     && (version != smoltcp::wire::IpVersion::Ipv6
-                        || self.owner_ipv6_enabled && !self.routes.has_ipv6_source_routes())
+                        || self.owner_ipv6_enabled
+                            && !self.routes.requires_authoritative_ipv6_lookup())
                     && !self.configured_neighbors.is_some_and(|neighbors| {
                         neighbors.lookup(route.oif, route.next_hop).is_some()
                     })

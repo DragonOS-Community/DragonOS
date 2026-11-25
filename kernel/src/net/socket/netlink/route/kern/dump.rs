@@ -1,6 +1,6 @@
 //! Bounded live rtnetlink dumps. Retain a request and cursors, not a snapshot
 //! of all devices, addresses, routes, or neighbors behind an idle reader.
-use super::{addr, link, neigh, route};
+use super::{addr, link, neigh, route, rule};
 use crate::{
     libs::mutex::Mutex,
     net::socket::{
@@ -73,6 +73,7 @@ impl RouteSocketState {
             RouteNlSegment::GetLink(_)
                 | RouteNlSegment::GetAddr(_)
                 | RouteNlSegment::GetRoute(_)
+                | RouteNlSegment::GetRule(_)
                 | RouteNlSegment::GetNeigh(_)
         ) && GetRequestFlags::from_bits_truncate(request.header().flags)
             .contains(GetRequestFlags::DUMP)
@@ -280,10 +281,24 @@ impl DumpSession {
                     CSegmentType::NEWADDR,
                 ))))
             }
-            RouteNlSegment::GetRoute(request) => {
-                if request.header().type_ == CSegmentType::GETRULE as u16 {
+            RouteNlSegment::GetRule(request) => {
+                let family = request.body().family;
+                if family != AddressFamily::Unspecified as u8
+                    && family != AddressFamily::INet6 as u8
+                {
                     return Ok(Some(self.done(position)));
                 }
+                let Some(entry) = crate::net::route::dump_ipv6_rule(netns, position.index) else {
+                    return Ok(Some(self.done(position)));
+                };
+                position.index += 1;
+                Ok(Some(rule::rule_segment(
+                    *request.header(),
+                    CSegmentType::NEWRULE,
+                    entry,
+                )?))
+            }
+            RouteNlSegment::GetRoute(request) => {
                 let Some(entry) = crate::net::route::dump_entry(netns, position.index) else {
                     return Ok(Some(self.done(position)));
                 };

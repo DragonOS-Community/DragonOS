@@ -424,7 +424,11 @@ impl<'a> NetIngressFilter<'a> {
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
     ) -> RouteInputVerdict {
-        let routes = match self.routes {
+        let policy_routes = self
+            .fib_routes
+            .filter(|routes| routes.has_ipv6_policy_rules());
+        let full_route_view = self.routes.or(policy_routes);
+        let routes = match full_route_view {
             Some(routes) => routes,
             // A forwarding namespace must not accept transit as local when
             // its full route view is unavailable.
@@ -451,10 +455,22 @@ impl<'a> NetIngressFilter<'a> {
         }
         let Some(route) = routes.lookup_ingress(destination.into(), ingress_ifindex, Some(source))
         else {
-            return RouteInputVerdict::Pass;
+            if policy_routes.is_none() {
+                return RouteInputVerdict::Pass;
+            }
+            if meta.link_group {
+                return RouteInputVerdict::Drop;
+            }
+            return self.defer_ipv6_error(
+                packet,
+                super::forward_mtu::Ipv6ForwardError::Unreachable {
+                    code: 0,
+                    ingress_ifindex,
+                },
+            );
         };
         let kind = route.matched.kind;
-        if self.routes.is_none()
+        if full_route_view.is_none()
             && kind != RTN_ANYCAST
             && !route.matched.is_explicit_ipv6_local()
             && !super::route::is_ipv6_reject_or_throw(kind)

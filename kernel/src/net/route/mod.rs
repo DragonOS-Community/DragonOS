@@ -7,6 +7,7 @@ mod fib;
 mod fib_index;
 mod lifecycle;
 pub(crate) mod pmtu;
+mod policy;
 pub(crate) mod ra;
 mod source;
 mod transaction;
@@ -15,6 +16,7 @@ mod validation;
 
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
+use smoltcp::phy::{RouteCookie, EMPTY_ROUTE_COOKIE};
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address, Ipv6AddressExt};
 use system_error::SystemError;
 
@@ -34,6 +36,7 @@ pub(crate) use lifecycle::{
     purge_iface_for_netns_teardown, register_iface, AddressLinkChange, Ipv6PrefixChange,
     PreparedAddressRouteCommit, PreparedIfaceUnregister, PreparedLinkStateChange,
 };
+pub(in crate::net) use policy::{Ipv6Rule, Ipv6RuleSelector};
 pub(crate) use source::{
     resolve_ipv4_output_flow, resolve_ipv4_route, Ipv4OutputFlow, ResolvedIpv4Route,
 };
@@ -227,8 +230,12 @@ impl OutputRouteGuard<'_> {
             .map(|iface| iface.mtu())
     }
 
-    pub(crate) fn has_ipv6_source_routes(&self) -> bool {
-        self.fib.has_ipv6_source_routes()
+    pub(crate) fn has_ipv6_policy_rules(&self) -> bool {
+        self.fib.ipv6_policy.changes_table_order()
+    }
+
+    pub(crate) fn requires_authoritative_ipv6_lookup(&self) -> bool {
+        self.fib.requires_authoritative_ipv6_lookup()
     }
 
     pub(crate) fn has_ipv6_special_routes(&self) -> bool {
@@ -296,7 +303,7 @@ impl OutputRouteGuard<'_> {
         oif: Option<u32>,
         source: Option<IpAddress>,
     ) -> Option<OutputRouteDecision> {
-        self.lookup_socket_output(destination, oif, source, 0)
+        self.lookup_socket_output(destination, oif, source, EMPTY_ROUTE_COOKIE)
     }
 
     pub(crate) fn lookup_socket_output(
@@ -304,7 +311,7 @@ impl OutputRouteGuard<'_> {
         destination: IpAddress,
         oif: Option<u32>,
         source: Option<IpAddress>,
-        route_cookie: u64,
+        route_cookie: RouteCookie,
     ) -> Option<OutputRouteDecision> {
         let route = if let (IpAddress::Ipv6(destination), Some(IpAddress::Ipv6(source))) =
             (destination, source)
@@ -664,7 +671,12 @@ pub(crate) fn local_address_owner(
     netns: &Arc<NetNamespace>,
     address: IpAddress,
 ) -> Option<Arc<dyn Iface>> {
-    let decision = lookup(netns, address)?;
+    // Bind validates address ownership independently of whether an IPv6
+    // policy rule currently makes the local address reachable by a packet.
+    let decision = match address {
+        IpAddress::Ipv4(_) => lookup(netns, address),
+        IpAddress::Ipv6(_) => netns.router().fib.read().lookup_local_table(address),
+    }?;
     if decision.matched.kind != RTN_LOCAL {
         return None;
     }
@@ -740,6 +752,47 @@ pub(crate) struct Ipv4MainRoute {
     order: fib_index::AliasOrder,
 }
 
+pub(in crate::net) fn dump_ipv6_rule(netns: &NetNamespace, index: usize) -> Option<Ipv6Rule> {
+    netns
+        .router()
+        .fib
+        .read()
+        .ipv6_policy
+        .rules()
+        .get(index)
+        .copied()
+}
+
+pub(in crate::net) fn insert_ipv6_rule(
+    _rtnl: &RtnlGuard,
+    netns: &NetNamespace,
+    selector: Ipv6RuleSelector,
+    exclusive: bool,
+) -> Result<Ipv6Rule, SystemError> {
+    edit_ipv6_policy(netns, |policy| policy.insert(selector, exclusive))
+}
+
+pub(in crate::net) fn remove_ipv6_rule(
+    _rtnl: &RtnlGuard,
+    netns: &NetNamespace,
+    selector: Ipv6RuleSelector,
+) -> Result<Ipv6Rule, SystemError> {
+    edit_ipv6_policy(netns, |policy| policy.remove(selector))
+}
+
+fn edit_ipv6_policy(
+    netns: &NetNamespace,
+    edit: impl FnOnce(&mut policy::Ipv6Policy) -> Result<Ipv6Rule, SystemError>,
+) -> Result<Ipv6Rule, SystemError> {
+    let router = netns.router();
+    let mut fib = router.fib_write();
+    let result = edit(&mut fib.ipv6_policy);
+    if result.is_err() {
+        fib.keep_pmtu();
+    }
+    result
+}
+
 /// Read-only display order. Neither the route lookup index nor formatted
 /// records are copied, and sorting runs after releasing the FIB lock.
 pub(crate) fn snapshot_ipv4_main(netns: &NetNamespace) -> Result<Vec<Ipv4MainRoute>, SystemError> {
@@ -790,7 +843,7 @@ pub(crate) fn resolve_gateway_oif(
     let minimum_scope =
         is_ipv4(gateway).then_some(route_scope.saturating_add(1).max(RT_SCOPE_LINK));
     let oif = fib
-        .resolve_gateway_with_builtin_rules(gateway, table, requested_oif, minimum_scope)
+        .resolve_gateway_with_policy(gateway, table, requested_oif, minimum_scope)
         .ok_or(if is_ipv4(gateway) {
             SystemError::ENETUNREACH
         } else {

@@ -1,5 +1,6 @@
 use inner::{UdpBindContext, UdpInner, UnboundUdp};
 use smoltcp;
+use smoltcp::phy::EMPTY_ROUTE_COOKIE;
 use smoltcp::wire::IpAddress;
 use system_error::SystemError;
 
@@ -665,7 +666,7 @@ impl UdpSocket {
                 // Keep an explicit address lock retained across disconnect.
                 local_addr: fixed_address
                     .unwrap_or(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED)),
-                route_cookie: 0,
+                route_cookie: EMPTY_ROUTE_COOKIE,
             });
         }
         let fixed_target = fixed_address
@@ -678,7 +679,7 @@ impl UdpSocket {
                 .map(|stack_owner| EphemeralBindTarget {
                     stack_owner,
                     local_addr: address,
-                    route_cookie: 0,
+                    route_cookie: EMPTY_ROUTE_COOKIE,
                 })
             })
             .transpose()?;
@@ -1223,13 +1224,13 @@ impl UdpSocket {
                         Some(UdpInner::Bound(bound)) => bound
                             .connection()
                             .filter(|connection| connection.source == Some(feedback.source))
-                            .map_or(0, |connection| {
+                            .map_or(EMPTY_ROUTE_COOKIE, |connection| {
                                 connection.route_cookie_for(remote.addr, oif)
                             }),
-                        _ => 0,
+                        _ => EMPTY_ROUTE_COOKIE,
                     }
                 } else {
-                    0
+                    EMPTY_ROUTE_COOKIE
                 };
                 let _ = crate::net::route::pmtu::learn(&self.netns, feedback, oif, cookie);
             }
@@ -1729,7 +1730,7 @@ impl UdpSocket {
                 };
                 let fixed_source = output_flow::bound_source_constraint(&self.netns, local)
                     .or(connection.and_then(|connection| connection.source));
-                let route_cookie = connection.map_or(0, |connection| {
+                let route_cookie = connection.map_or(EMPTY_ROUTE_COOKIE, |connection| {
                     connection.route_cookie_for(destination.addr, required_oif)
                 });
                 let resolved = crate::net::route::resolve_ipv6_socket_route(

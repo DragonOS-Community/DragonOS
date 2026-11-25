@@ -3,6 +3,7 @@ use crate::net::socket::inet::common::SocketDeviceBinding;
 use alloc::sync::Arc;
 use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use smoltcp::phy::{RouteCookie, EMPTY_ROUTE_COOKIE};
 
 use crate::filesystem::epoll::EPollEventType;
 use crate::libs::rwsem::RwSem;
@@ -352,7 +353,7 @@ impl Init {
             super::bound::TcpBound,
             smoltcp::wire::IpEndpoint,
             TcpPortReservation,
-            u64,
+            RouteCookie,
         ),
         (Self, SystemError),
     > {
@@ -462,7 +463,9 @@ impl Init {
                 device_binding.clone(),
                 owner,
             )?,
-            Init::Bound((inner, local, reservation)) => (inner, local, reservation, 0),
+            Init::Bound((inner, local, reservation)) => {
+                (inner, local, reservation, EMPTY_ROUTE_COOKIE)
+            }
         };
         if let Err(err) = socket::inet::common::ensure_bound_dual_stack_remote_compatible(
             local.addr,

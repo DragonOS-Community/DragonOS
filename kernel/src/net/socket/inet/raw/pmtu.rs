@@ -17,6 +17,7 @@ use crate::{
     process::namespace::net_namespace::NetNamespace,
 };
 use alloc::{sync::Arc, vec::Vec};
+use smoltcp::phy::EMPTY_ROUTE_COOKIE;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpProtocol, IpVersion};
 use system_error::SystemError;
 
@@ -150,7 +151,12 @@ impl RawSocket {
                 0 => None,
                 index => Some(index as u32),
             };
-            let _ = crate::net::route::pmtu::learn(&self.netns, feedback, required_oif, 0);
+            let _ = crate::net::route::pmtu::learn(
+                &self.netns,
+                feedback,
+                required_oif,
+                EMPTY_ROUTE_COOKIE,
+            );
         }
         if !connected && !recverr {
             return;

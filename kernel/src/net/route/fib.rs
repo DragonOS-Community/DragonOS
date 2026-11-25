@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use smoltcp::phy::{RouteCookie, EMPTY_ROUTE_COOKIE};
 
 use smoltcp::iface::Route as SmolRoute;
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
@@ -10,9 +11,11 @@ use super::{
         learned_projection, projection_key, AliasPlacement, BroadcastLookup, FibIndex,
         ProjectionKey,
     },
-    is_ipv4, RouteDeleteSelector, RouteEntry, RouteLookupResult, RouteMutationOutcome,
-    RouteNewFlags, RouteNotifications, RouteSourcePolicy, RT_SCOPE_LINK, RT_TABLE_DEFAULT,
-    RT_TABLE_LOCAL, RT_TABLE_MAIN,
+    is_ipv4,
+    policy::Ipv6Policy,
+    RouteDeleteSelector, RouteEntry, RouteLookupResult, RouteMutationOutcome, RouteNewFlags,
+    RouteNotifications, RouteSourcePolicy, RT_SCOPE_LINK, RT_TABLE_DEFAULT, RT_TABLE_LOCAL,
+    RT_TABLE_MAIN,
 };
 
 // Router advertisements must not grow the namespace FIB without bound.
@@ -24,6 +27,7 @@ const MAX_LEARNED_PREFIX_ROUTES: usize = 256;
 pub(in crate::net) struct FibTable {
     entries: Vec<RouteEntry>,
     index: FibIndex,
+    pub(super) ipv6_policy: Ipv6Policy,
 }
 
 impl FibTable {
@@ -383,6 +387,7 @@ impl FibTable {
         Ok(Self {
             entries,
             index: self.index.try_clone()?,
+            ipv6_policy: self.ipv6_policy.try_clone()?,
         })
     }
 
@@ -909,19 +914,39 @@ impl FibTable {
         }
     }
 
-    fn lookup_builtin_rules(
+    fn lookup_policy<T>(
         &self,
         destination: IpAddress,
+        source: Option<Ipv6Address>,
+        lookup: impl FnMut(u32) -> Option<T>,
+    ) -> Option<T> {
+        match destination {
+            IpAddress::Ipv4(_) => builtin_rule_tables(destination)
+                .iter()
+                .copied()
+                .find_map(lookup),
+            IpAddress::Ipv6(_) => self.ipv6_policy.lookup_tables(source).find_map(lookup),
+        }
+    }
+
+    fn lookup_routed_flow(
+        &self,
+        destination: IpAddress,
+        source: Option<Ipv6Address>,
         mut key: impl FnMut(u32) -> FibLookupKey,
     ) -> Option<RouteLookupResult> {
-        builtin_rule_tables(destination).iter().find_map(|table| {
-            self.lookup_key(key(*table))
+        self.lookup_policy(destination, source, |table| {
+            self.lookup_key(key(table))
                 .filter(|route| route.matched.kind != super::RTN_THROW)
         })
     }
 
+    pub(super) fn lookup_local_table(&self, address: IpAddress) -> Option<RouteLookupResult> {
+        self.lookup_key(FibLookupKey::output(address, RT_TABLE_LOCAL))
+    }
+
     pub(super) fn lookup_output(&self, destination: IpAddress) -> Option<RouteLookupResult> {
-        self.lookup_builtin_rules(destination, |table| {
+        self.lookup_routed_flow(destination, None, |table| {
             FibLookupKey::output(destination, table)
         })
     }
@@ -933,7 +958,7 @@ impl FibTable {
         source: Option<Ipv6Address>,
     ) -> Option<RouteLookupResult> {
         let destination = IpAddress::Ipv6(destination);
-        self.lookup_builtin_rules(destination, |table| FibLookupKey {
+        self.lookup_routed_flow(destination, source, |table| FibLookupKey {
             source,
             ..match oif {
                 Some(oif) => FibLookupKey::on_iface(destination, table, oif),
@@ -942,27 +967,30 @@ impl FibTable {
         })
     }
 
-    /// The IPv6 output RPDB uses built-in tables, whose IDs fit in one byte.
-    /// The low bytes identify the original table and destination prefix.
+    /// Preserve the first match of a connect without a fixed source. The
+    /// packet path carries two opaque 64-bit words: prefix serial (48), the
+    /// high policy generation bits (8), prefix length (8), then low policy
+    /// generation bits (32) and the full table ID (32).
     pub(super) fn ipv6_route_cookie(
         &self,
         route: RouteLookupResult,
         destination: Ipv6Address,
         required_oif: Option<u32>,
-    ) -> u64 {
-        let Ok(table) = u8::try_from(route.table) else {
-            return 0;
-        };
+    ) -> RouteCookie {
         let serial = self.index.ipv6_serial(route.matched);
+        let generation = self.ipv6_policy.generation();
         let length = route.matched.destination.prefix_len();
-        let cookie = (serial << 16) | (u64::from(table) << 8) | u64::from(length);
+        let cookie = [
+            (serial << 16) | ((generation >> 32) & 0xff) << 8 | u64::from(length),
+            (generation << 32) | u64::from(route.table),
+        ];
         if self
             .cached_ipv6_output(destination, required_oif, cookie)
             .is_some_and(|cached| cached.matched == route.matched)
         {
             cookie
         } else {
-            0
+            EMPTY_ROUTE_COOKIE
         }
     }
 
@@ -970,17 +998,22 @@ impl FibTable {
         &self,
         destination: Ipv6Address,
         required_oif: Option<u32>,
-        cookie: u64,
+        cookie: RouteCookie,
     ) -> Option<RouteLookupResult> {
+        let [prefix_word, policy_word] = cookie;
+        let generation = ((prefix_word >> 8) & 0xff) << 32 | policy_word >> 32;
+        if generation != self.ipv6_policy.generation() {
+            return None;
+        }
         let destination = IpAddress::Ipv6(destination);
-        let table = (cookie >> 8) as u8 as u32;
-        let prefix_len = cookie as u8;
+        let table = policy_word as u32;
+        let prefix_len = prefix_word as u8;
         let index = self.index.ipv6_cookie_winner(
             &self.entries,
             destination,
             table,
             prefix_len,
-            cookie >> 16,
+            prefix_word >> 16,
             required_oif,
         )?;
         Some(self.route_result(index, destination))
@@ -991,9 +1024,9 @@ impl FibTable {
         destination: Ipv6Address,
         required_oif: Option<u32>,
         source: Option<Ipv6Address>,
-        cookie: u64,
+        cookie: RouteCookie,
     ) -> Option<RouteLookupResult> {
-        if cookie != 0 && self.has_ipv6_source_routes() {
+        if cookie != EMPTY_ROUTE_COOKIE && self.ipv6_uses_source_for_lookup() {
             if let Some(route) = self.cached_ipv6_output(destination, required_oif, cookie) {
                 return Some(route);
             }
@@ -1024,7 +1057,7 @@ impl FibTable {
         destination: IpAddress,
         oif: u32,
     ) -> Option<RouteLookupResult> {
-        self.lookup_builtin_rules(destination, |table| {
+        self.lookup_routed_flow(destination, None, |table| {
             FibLookupKey::on_iface(destination, table, oif)
         })
         // Linux IPv4 treats an explicit output interface as an on-link route
@@ -1054,7 +1087,7 @@ impl FibTable {
         .then_some(ingress_oif);
         let preferred_oif = (matches!(destination, IpAddress::Ipv6(_)) && required_oif.is_none())
             .then_some(ingress_oif);
-        self.lookup_builtin_rules(destination, |table| FibLookupKey {
+        self.lookup_routed_flow(destination, source, |table| FibLookupKey {
             source,
             required_oif,
             preferred_oif,
@@ -1068,14 +1101,22 @@ impl FibTable {
     /// needs that path when main-table routing is configured: a socketless
     /// ICMPv6 reply may leave through a different interface from its owner.
     pub(in crate::net) fn requires_authoritative_output(&self) -> bool {
-        self.index.has_ipv4_routes(RT_TABLE_DEFAULT)
+        self.requires_authoritative_ipv6_lookup()
+            || self.index.has_ipv4_routes(RT_TABLE_DEFAULT)
             || self.index.has_ipv6_routes(RT_TABLE_MAIN)
-            || self.has_ipv6_source_routes()
             || self.has_ipv6_special_routes()
+    }
+
+    pub(super) fn requires_authoritative_ipv6_lookup(&self) -> bool {
+        self.ipv6_policy.changes_table_order() || self.has_ipv6_source_routes()
     }
 
     pub(super) fn has_ipv6_special_routes(&self) -> bool {
         self.index.has_ipv6_special_routes()
+    }
+
+    pub(super) fn ipv6_uses_source_for_lookup(&self) -> bool {
+        self.has_ipv6_source_routes() || self.ipv6_policy.has_source_rules()
     }
 
     pub(super) fn has_ipv6_source_routes(&self) -> bool {
@@ -1108,10 +1149,10 @@ impl FibTable {
         Some(winner.oif)
     }
 
-    /// Resolve a gateway using the built-in table order after checking the
+    /// Resolve a gateway using the routing policy after checking the
     /// route's own table. IPv4 only needs the precheck for non-main routes.
     /// IPv6 validates the first raw winner of the fallback.
-    pub(super) fn resolve_gateway_with_builtin_rules(
+    pub(super) fn resolve_gateway_with_policy(
         &self,
         destination: IpAddress,
         route_table: u32,
@@ -1125,7 +1166,7 @@ impl FibTable {
                     // Linux nexthop validation examines the first raw FIB
                     // winner. A throw can skip a table for normal traffic,
                     // but is not a usable route to the gateway.
-                    let winner = builtin_rule_tables(destination).iter().find_map(|&table| {
+                    let winner = self.lookup_policy(destination, None, |table| {
                         self.lookup_key(FibLookupKey::gateway(
                             destination,
                             table,

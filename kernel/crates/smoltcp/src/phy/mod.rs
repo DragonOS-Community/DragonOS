@@ -132,6 +132,13 @@ pub use self::tracer::Tracer;
 ))]
 pub use self::tuntap_interface::TunTapInterface;
 
+/// Routing state passed through smoltcp without interpreting its contents.
+#[cfg(feature = "packetmeta-id")]
+pub type RouteCookie = [u64; 2];
+
+#[cfg(feature = "packetmeta-id")]
+pub const EMPTY_ROUTE_COOKIE: RouteCookie = [0; 2];
+
 /// Metadata associated to a packet.
 ///
 /// The packet metadata is a set of attributes associated to network packets
@@ -173,7 +180,7 @@ pub struct PacketMeta {
     pub ipv6_anycast: bool,
     /// Opaque route state supplied by the caller for socket output.
     #[cfg(feature = "packetmeta-id")]
-    pub route_cookie: u64,
+    pub route_cookie: RouteCookie,
 }
 
 #[cfg(all(test, feature = "packetmeta-id"))]
@@ -185,7 +192,7 @@ impl PacketMeta {
             link_group: false,
             #[cfg(feature = "proto-ipv6")]
             ipv6_anycast: false,
-            route_cookie: 0,
+            route_cookie: EMPTY_ROUTE_COOKIE,
         }
     }
 }

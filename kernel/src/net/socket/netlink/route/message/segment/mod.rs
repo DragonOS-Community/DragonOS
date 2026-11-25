@@ -3,6 +3,7 @@ pub mod link;
 pub mod neigh;
 pub mod prefix;
 pub mod route;
+pub mod rule;
 
 use crate::net::socket::netlink::{
     message::{
@@ -24,6 +25,7 @@ use crate::net::socket::netlink::{
                 CRtMsg, RouteFlags, RouteProtocol, RouteScope, RouteSegment, RouteSegmentBody,
                 RouteTable, RouteType,
             },
+            rule::{RuleSegment, RuleSegmentBody},
         },
     },
 };
@@ -48,6 +50,9 @@ pub enum RouteNlSegment {
     NewRoute(RouteSegment),
     DelRoute(RouteSegment),
     GetRoute(RouteSegment),
+    NewRule(RuleSegment),
+    DelRule(RuleSegment),
+    GetRule(RuleSegment),
     NewNeigh(NeighSegment),
     DelNeigh(NeighSegment),
     GetNeigh(NeighSegment),
@@ -60,6 +65,9 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewRoute(route_segment)
             | RouteNlSegment::DelRoute(route_segment)
             | RouteNlSegment::GetRoute(route_segment) => route_segment.header(),
+            RouteNlSegment::NewRule(segment)
+            | RouteNlSegment::DelRule(segment)
+            | RouteNlSegment::GetRule(segment) => segment.header(),
             RouteNlSegment::NewAddr(addr_segment)
             | RouteNlSegment::DelAddr(addr_segment)
             | RouteNlSegment::GetAddr(addr_segment) => addr_segment.header(),
@@ -83,6 +91,9 @@ impl ProtocolSegment for RouteNlSegment {
             RouteNlSegment::NewRoute(route_segment)
             | RouteNlSegment::DelRoute(route_segment)
             | RouteNlSegment::GetRoute(route_segment) => route_segment.header_mut(),
+            RouteNlSegment::NewRule(segment)
+            | RouteNlSegment::DelRule(segment)
+            | RouteNlSegment::GetRule(segment) => segment.header_mut(),
             RouteNlSegment::NewAddr(addr_segment)
             | RouteNlSegment::DelAddr(addr_segment)
             | RouteNlSegment::GetAddr(addr_segment) => addr_segment.header_mut(),
@@ -160,12 +171,20 @@ impl ProtocolSegment for RouteNlSegment {
             CSegmentType::SETLINK => {
                 RouteNlSegment::SetLink(LinkSegment::read_from_buf(header, payload_buf)?)
             }
+            CSegmentType::NEWRULE => {
+                RouteNlSegment::NewRule(RuleSegment::read_from_buf(header, payload_buf)?)
+            }
+            CSegmentType::DELRULE => {
+                RouteNlSegment::DelRule(RuleSegment::read_from_buf(header, payload_buf)?)
+            }
             CSegmentType::GETRULE => {
-                if payload_len < size_of::<CRtMsg>() {
-                    RouteNlSegment::GetRoute(read_short_getroute_segment(header, payload_buf)?)
-                } else {
-                    RouteNlSegment::GetRoute(RouteSegment::read_from_buf(header, payload_buf)?)
-                }
+                let body = RuleSegmentBody {
+                    family: read_rtgen_family(payload_buf)? as u8,
+                    ..RuleSegmentBody::default()
+                };
+                let mut segment = RuleSegment::new(header, body, Vec::new());
+                segment.header_mut().len = header.len;
+                RouteNlSegment::GetRule(segment)
             }
             CSegmentType::NEWNEIGH => {
                 RouteNlSegment::NewNeigh(NeighSegment::read_from_buf(header, payload_buf)?)
@@ -195,6 +214,9 @@ impl ProtocolSegment for RouteNlSegment {
             }
             RouteNlSegment::NewRoute(route_segment) | RouteNlSegment::DelRoute(route_segment) => {
                 route_segment.write_to_buf(buf)?
+            }
+            RouteNlSegment::NewRule(segment) | RouteNlSegment::DelRule(segment) => {
+                segment.write_to_buf(buf)?
             }
             RouteNlSegment::NewLink(link_segment) | RouteNlSegment::DelLink(link_segment) => {
                 link_segment.write_to_buf(buf)?

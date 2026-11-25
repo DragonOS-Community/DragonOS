@@ -30,6 +30,7 @@ mod link;
 mod neigh;
 mod prefix;
 mod route;
+mod rule;
 pub(crate) use prefix::{has_prefix_listeners, notify_ra_prefix};
 pub(crate) use route::notify_automatic_ipv6_route;
 mod utils;
@@ -223,8 +224,9 @@ fn dispatch_request(
         RouteNlSegment::NewLink(request) => link::do_new_link(rtnl, request, context),
         RouteNlSegment::DelLink(request) => link::do_del_link(rtnl, request, netns),
         RouteNlSegment::SetLink(request) => link::do_set_link(rtnl, request, context),
-        RouteNlSegment::GetRoute(_) if seg_type == CSegmentType::GETRULE => {
-            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        RouteNlSegment::GetRule(_) => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+        RouteNlSegment::NewRule(request) | RouteNlSegment::DelRule(request) => {
+            rule::change(rtnl, request, context, seg_type)
         }
         RouteNlSegment::GetRoute(request) => route::do_get_route(request, netns),
         RouteNlSegment::NewRoute(request) => route::do_new_route(rtnl, request, netns),

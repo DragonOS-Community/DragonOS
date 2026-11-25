@@ -1,6 +1,7 @@
 //! TCP protocol handles belong to a namespace, not an address-owning device.
 
 use alloc::sync::Arc;
+use smoltcp::phy::RouteCookie;
 use smoltcp::{iface::SocketHandle, socket::tcp, wire::IpAddress};
 use system_error::SystemError;
 
@@ -76,7 +77,7 @@ impl TcpBound {
         remote: IpAddress,
         netns: Arc<NetNamespace>,
         device: Option<Arc<dyn Iface>>,
-    ) -> Result<(Self, IpAddress, u64), (tcp::Socket<'static>, SystemError)> {
+    ) -> Result<(Self, IpAddress, RouteCookie), (tcp::Socket<'static>, SystemError)> {
         let target = match common::tcp_connect_target(&remote, &netns, device) {
             Ok(target) => target,
             Err(error) => return Err((socket, error)),

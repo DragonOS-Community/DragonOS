@@ -2,6 +2,7 @@
 //! learning; this table never calls back into sockets, FIB or netdevices.
 
 use alloc::{sync::Arc, vec::Vec};
+use smoltcp::phy::{RouteCookie, EMPTY_ROUTE_COOKIE};
 use smoltcp::wire::IpAddress;
 
 use super::OutputRouteDecision;
@@ -173,13 +174,13 @@ pub(crate) fn lookup_output_route(
     required_oif: Option<u32>,
     original: (IpAddress, IpAddress),
     wire: (IpAddress, IpAddress),
-    route_cookie: u64,
+    route_cookie: RouteCookie,
 ) -> Option<OutputRouteDecision> {
     if matches!(original.0, IpAddress::Ipv6(_)) {
         let cookie = if original.1 == wire.1 {
             route_cookie
         } else {
-            0
+            EMPTY_ROUTE_COOKIE
         };
         routes
             .lookup_socket_output(wire.1, required_oif, Some(original.0), cookie)?
@@ -195,7 +196,7 @@ pub(crate) fn learn(
     netns: &Arc<NetNamespace>,
     feedback: &crate::net::icmp_error::IcmpErrorFeedback,
     required_oif: Option<u32>,
-    route_cookie: u64,
+    route_cookie: RouteCookie,
 ) -> Option<PathMtu> {
     let mtu = feedback.mtu()?;
     let (source, destination) = crate::net::icmp_error::routed_quote_flow(netns, feedback);

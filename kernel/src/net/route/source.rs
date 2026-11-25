@@ -6,6 +6,7 @@
 use alloc::{collections::BTreeMap, sync::Arc};
 use core::cmp::Reverse;
 
+use smoltcp::phy::{RouteCookie, EMPTY_ROUTE_COOKIE};
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address, Ipv6AddressExt};
 use system_error::SystemError;
 
@@ -130,12 +131,12 @@ pub(crate) struct ResolvedIpv6SendRoute {
     pub(crate) decision: super::OutputRouteDecision,
     pub(crate) source: Ipv6Address,
     pub(crate) source_owner: Arc<dyn Iface>,
-    pub(crate) route_cookie: u64,
+    pub(crate) route_cookie: RouteCookie,
 }
 
 pub(crate) enum Ipv6RouteIntent {
     Connect,
-    Send(u64),
+    Send(RouteCookie),
 }
 
 impl ResolvedIpv4Route {
@@ -399,7 +400,7 @@ pub(crate) fn resolve_ipv6_send_route(
         destination,
         required_oif,
         fixed_source,
-        Ipv6RouteIntent::Send(0),
+        Ipv6RouteIntent::Send(EMPTY_ROUTE_COOKIE),
     )
 }
 
@@ -423,7 +424,7 @@ pub(crate) fn resolve_ipv6_socket_route(
     };
     let mut source = fixed_source;
     let cookie = match intent {
-        Ipv6RouteIntent::Connect => 0,
+        Ipv6RouteIntent::Connect => EMPTY_ROUTE_COOKIE,
         Ipv6RouteIntent::Send(cookie) => cookie,
     };
     let mut selected = fib.lookup_ipv6_socket_output(destination_v6, required_oif, source, cookie);
@@ -433,14 +434,14 @@ pub(crate) fn resolve_ipv6_socket_route(
         && fixed_source.is_none()
         && matches!(intent, Ipv6RouteIntent::Connect)
     {
-        selected.map_or(0, |route| {
+        selected.map_or(EMPTY_ROUTE_COOKIE, |route| {
             fib.ipv6_route_cookie(route, destination_v6, required_oif)
         })
     } else {
-        0
+        EMPTY_ROUTE_COOKIE
     };
     if source.is_none()
-        && (first_rejected || selected.is_none() && fib.has_ipv6_source_routes())
+        && (first_rejected || selected.is_none() && fib.ipv6_uses_source_for_lookup())
         && !destination_v6.is_unspecified()
     {
         // Without an initial route there is no egress or preferred source.

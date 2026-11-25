@@ -1,6 +1,8 @@
 #include "rtnetlink_route_test_support.h"
 
+#include <array>
 #include <linux/errqueue.h>
+#include <linux/fib_rules.h>
 #include <poll.h>
 
 TEST(RtnetlinkRouteSemantics, Ipv4BuiltinRulesFallBackFromMainToDefaultTable) {
@@ -1432,6 +1434,161 @@ TEST(RtnetlinkRouteSemantics, RouteProjectionScalesBeyondFormerFixedCapacity) {
                                    ++seq),
                   0);
     }
+}
+
+namespace {
+
+struct Ipv6RuleRecord {
+    uint32_t table = 0;
+    uint32_t priority = 0;
+    uint8_t protocol = RTPROT_UNSPEC;
+    uint8_t source_length = 0;
+    std::array<uint8_t, 16> source{};
+};
+
+int ChangeIpv6Rule(int fd, uint16_t kind, uint32_t sequence, uint32_t priority,
+                   uint32_t table, const char* source = nullptr, uint8_t source_length = 0) {
+    alignas(nlmsghdr) char buffer[128]{};
+    auto* header = reinterpret_cast<nlmsghdr*>(buffer);
+    header->nlmsg_len = NLMSG_LENGTH(sizeof(fib_rule_hdr));
+    header->nlmsg_type = kind;
+    header->nlmsg_seq = sequence;
+    header->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    if (kind == RTM_NEWRULE) header->nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+    auto* body = static_cast<fib_rule_hdr*>(NLMSG_DATA(header));
+    body->family = AF_INET6;
+    body->action = kind == RTM_NEWRULE ? FR_ACT_TO_TBL : FR_ACT_UNSPEC;
+    body->src_len = source_length;
+    AddAttr(header, sizeof(buffer), FRA_PRIORITY, &priority, sizeof(priority));
+    if (table != 0) AddAttr(header, sizeof(buffer), FRA_TABLE, &table, sizeof(table));
+    const uint32_t no_suppress = UINT32_MAX;
+    AddAttr(header, sizeof(buffer), FRA_SUPPRESS_PREFIXLEN, &no_suppress, sizeof(no_suppress));
+    if (source != nullptr) {
+        in6_addr address{};
+        if (inet_pton(AF_INET6, source, &address) != 1) return EINVAL;
+        AddAttr(header, sizeof(buffer), FRA_SRC, &address, sizeof(address));
+    }
+    if (send(fd, header, header->nlmsg_len, 0) < 0) return errno;
+    return RecvAck(fd, sequence);
+}
+
+std::optional<std::vector<Ipv6RuleRecord>> DumpIpv6Rules(int fd, uint32_t sequence) {
+    struct {
+        nlmsghdr header;
+        fib_rule_hdr body;
+    } request{};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(request.body));
+    request.header.nlmsg_type = RTM_GETRULE;
+    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    request.header.nlmsg_seq = sequence;
+    request.body.family = AF_INET6;
+    if (send(fd, &request, request.header.nlmsg_len, 0) < 0) return std::nullopt;
+
+    std::vector<Ipv6RuleRecord> rules;
+    for (;;) {
+        alignas(nlmsghdr) char buffer[4096]{};
+        int length = static_cast<int>(recv(fd, buffer, sizeof(buffer), 0));
+        if (length <= 0) return std::nullopt;
+        for (auto* header = reinterpret_cast<nlmsghdr*>(buffer); NLMSG_OK(header, length);
+             header = NLMSG_NEXT(header, length)) {
+            if (header->nlmsg_seq != sequence) continue;
+            if (header->nlmsg_type == NLMSG_DONE) return rules;
+            if (header->nlmsg_type != RTM_NEWRULE ||
+                header->nlmsg_len < NLMSG_LENGTH(sizeof(fib_rule_hdr))) return std::nullopt;
+            const auto* body = static_cast<const fib_rule_hdr*>(NLMSG_DATA(header));
+            if (body->family != AF_INET6 || body->action != FR_ACT_TO_TBL) return std::nullopt;
+            Ipv6RuleRecord rule{};
+            rule.table = body->table;
+            rule.source_length = body->src_len;
+            int size = header->nlmsg_len - NLMSG_LENGTH(sizeof(*body));
+            auto* attr = reinterpret_cast<const rtattr*>(
+                reinterpret_cast<const char*>(body) + NLMSG_ALIGN(sizeof(*body)));
+            for (; RTA_OK(attr, size); attr = RTA_NEXT(attr, size)) {
+                if (attr->rta_type == FRA_TABLE && RTA_PAYLOAD(attr) == sizeof(rule.table)) {
+                    std::memcpy(&rule.table, RTA_DATA(attr), sizeof(rule.table));
+                } else if (attr->rta_type == FRA_PRIORITY &&
+                           RTA_PAYLOAD(attr) == sizeof(rule.priority)) {
+                    std::memcpy(&rule.priority, RTA_DATA(attr), sizeof(rule.priority));
+                } else if (attr->rta_type == FRA_PROTOCOL &&
+                           RTA_PAYLOAD(attr) == sizeof(rule.protocol)) {
+                    std::memcpy(&rule.protocol, RTA_DATA(attr), sizeof(rule.protocol));
+                } else if (attr->rta_type == FRA_SRC && RTA_PAYLOAD(attr) == rule.source.size()) {
+                    std::memcpy(rule.source.data(), RTA_DATA(attr), rule.source.size());
+                }
+            }
+            rules.push_back(rule);
+        }
+    }
+}
+
+}  // namespace
+
+TEST(RtnetlinkRouteSemantics, Ipv6PolicyRulesKeepStableOrderAndNotify) {
+    const pid_t child = fork();
+    ASSERT_GE(child, 0) << ErrnoString(errno);
+    if (child == 0) {
+        [] {
+            ASSERT_EQ(unshare(CLONE_NEWNET), 0) << ErrnoString(errno);
+            FdGuard fd(OpenRouteSocket());
+            FdGuard listener(OpenRouteListener(1u << (RTNLGRP_IPV6_RULE - 1)));
+            ASSERT_GE(fd.Get(), 0);
+            ASSERT_GE(listener.Get(), 0);
+            const timeval timeout{2, 0};
+            ASSERT_EQ(setsockopt(fd.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), 0);
+            uint32_t sequence = 7300;
+            auto rules = DumpIpv6Rules(fd.Get(), ++sequence);
+            ASSERT_TRUE(rules);
+            ASSERT_EQ(rules->size(), 2u);
+            EXPECT_EQ((*rules)[0].table, static_cast<uint32_t>(RT_TABLE_LOCAL));
+            EXPECT_EQ((*rules)[0].protocol, RTPROT_KERNEL);
+            EXPECT_EQ((*rules)[1].priority, 32766u);
+
+            constexpr char source[] = "fd73:2::a";
+            EXPECT_EQ(ChangeIpv6Rule(fd.Get(), RTM_NEWRULE, ++sequence, 74, 173, nullptr, 64),
+                      EINVAL);
+            ASSERT_EQ(ChangeIpv6Rule(fd.Get(), RTM_NEWRULE, ++sequence, 74, 174, source, 64), 0);
+            EXPECT_EQ(ReceiveNotificationType(listener.Get()), RTM_NEWRULE);
+            ASSERT_EQ(ChangeIpv6Rule(fd.Get(), RTM_NEWRULE, ++sequence, 74, 100173, source, 64), 0);
+            EXPECT_EQ(ReceiveNotificationType(listener.Get()), RTM_NEWRULE);
+            EXPECT_EQ(ChangeIpv6Rule(fd.Get(), RTM_NEWRULE, ++sequence, 74, 100173, source, 64),
+                      EEXIST);
+
+            rules = DumpIpv6Rules(fd.Get(), ++sequence);
+            ASSERT_TRUE(rules);
+            ASSERT_EQ(rules->size(), 4u);
+            EXPECT_EQ((*rules)[1].table, 174u);
+            EXPECT_EQ((*rules)[2].table, 100173u);
+            EXPECT_EQ((*rules)[2].priority, 74u);
+            EXPECT_EQ((*rules)[2].source_length, 64);
+            EXPECT_EQ((*rules)[2].source[15], 0x0a);
+            ASSERT_EQ(ChangeIpv6Rule(fd.Get(), RTM_DELRULE, ++sequence, 74, 100173, source, 64), 0);
+            EXPECT_EQ(ReceiveNotificationType(listener.Get()), RTM_DELRULE);
+            EXPECT_EQ(ChangeIpv6Rule(fd.Get(), RTM_DELRULE, ++sequence, 74, 100173, source, 64),
+                      ENOENT);
+            rules = DumpIpv6Rules(fd.Get(), ++sequence);
+            ASSERT_TRUE(rules);
+            ASSERT_EQ(rules->size(), 3u);
+            EXPECT_EQ((*rules)[1].table, 174u);
+
+            const uint32_t lo = if_nametoindex("lo");
+            ASSERT_NE(lo, 0u);
+            ASSERT_EQ(SetLinkUp(fd.Get(), lo, true, ++sequence), 0);
+            ASSERT_EQ(ChangeIpv6Rule(fd.Get(), RTM_DELRULE, ++sequence, 0, RT_TABLE_LOCAL), 0);
+            EXPECT_EQ(ReceiveNotificationType(listener.Get()), RTM_DELRULE);
+            FdGuard udp(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(udp.Get(), 0);
+            sockaddr_in6 local{};
+            local.sin6_family = AF_INET6;
+            local.sin6_addr = in6addr_loopback;
+            EXPECT_EQ(bind(udp.Get(), reinterpret_cast<const sockaddr*>(&local), sizeof(local)), 0)
+                << ErrnoString(errno);
+        }();
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child) << ErrnoString(errno);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 int main(int argc, char** argv) {

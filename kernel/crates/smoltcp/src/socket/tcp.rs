@@ -14,6 +14,8 @@ use core::task::Waker;
 use core::{fmt, mem};
 
 use crate::phy::PacketMeta;
+#[cfg(feature = "packetmeta-id")]
+use crate::phy::{RouteCookie, EMPTY_ROUTE_COOKIE};
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
 use crate::socket::{Context, PollAt};
@@ -585,7 +587,7 @@ pub struct Socket<'a> {
     #[cfg(feature = "packetmeta-id")]
     connection_bound_device: Option<NonZeroU32>,
     #[cfg(feature = "packetmeta-id")]
-    tx_route_cookie: u64,
+    tx_route_cookie: RouteCookie,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -817,7 +819,7 @@ impl<'a> Socket<'a> {
             #[cfg(feature = "packetmeta-id")]
             connection_bound_device: None,
             #[cfg(feature = "packetmeta-id")]
-            tx_route_cookie: 0,
+            tx_route_cookie: EMPTY_ROUTE_COOKIE,
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -1694,7 +1696,7 @@ impl<'a> Socket<'a> {
         self.tuple = None;
         #[cfg(feature = "packetmeta-id")]
         {
-            self.tx_route_cookie = 0;
+            self.tx_route_cookie = EMPTY_ROUTE_COOKIE;
         }
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
@@ -2547,20 +2549,20 @@ impl<'a> Socket<'a> {
     /// this device ID, or zero when unconstrained.
     #[cfg(feature = "packetmeta-id")]
     pub fn set_bound_device(&mut self, device: Option<NonZeroU32>) {
-        self.tx_route_cookie = 0;
+        self.tx_route_cookie = EMPTY_ROUTE_COOKIE;
         self.listen_bound_device = device;
         self.connection_bound_device = device;
     }
 
     /// Publish the caller's routing state for the active connection.
     #[cfg(feature = "packetmeta-id")]
-    pub fn set_tx_route_cookie(&mut self, cookie: u64) {
+    pub fn set_tx_route_cookie(&mut self, cookie: RouteCookie) {
         self.tx_route_cookie = cookie;
     }
 
     /// Read the same routing state used by packet and MTU dispatch.
     #[cfg(feature = "packetmeta-id")]
-    pub fn tx_route_cookie(&self) -> u64 {
+    pub fn tx_route_cookie(&self) -> RouteCookie {
         self.tx_route_cookie
     }
 

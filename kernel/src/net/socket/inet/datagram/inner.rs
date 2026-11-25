@@ -1,4 +1,5 @@
 use alloc::sync::{Arc, Weak};
+use smoltcp::phy::{RouteCookie, EMPTY_ROUTE_COOKIE};
 
 use smoltcp;
 use system_error::SystemError;
@@ -270,7 +271,7 @@ pub(super) struct UdpConnection {
     pub(super) remote: smoltcp::wire::IpEndpoint,
     pub(super) source: Option<smoltcp::wire::IpAddress>,
     pub(super) required_oif: Option<u32>,
-    pub(super) route_cookie: u64,
+    pub(super) route_cookie: RouteCookie,
 }
 
 impl UdpConnection {
@@ -278,11 +279,11 @@ impl UdpConnection {
         self,
         destination: smoltcp::wire::IpAddress,
         required_oif: Option<u32>,
-    ) -> u64 {
+    ) -> RouteCookie {
         if self.remote.addr == destination && self.required_oif == required_oif {
             self.route_cookie
         } else {
-            0
+            EMPTY_ROUTE_COOKIE
         }
     }
 }
@@ -332,7 +333,7 @@ impl BoundUdp {
 
     pub(super) fn reset_route_cookie(&self) {
         if let Some(connection) = self.connection.lock().as_mut() {
-            connection.route_cookie = 0;
+            connection.route_cookie = EMPTY_ROUTE_COOKIE;
         }
     }
 

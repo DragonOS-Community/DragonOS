@@ -1,6 +1,7 @@
 use super::*;
 use crate::net::socket::recv_timeout::ReceiveTimeout;
 use crate::net::socket::SocketInodeMetadata;
+use smoltcp::phy::EMPTY_ROUTE_COOKIE;
 
 impl UdpSocket {
     /// Keep the socket's address family at the name-query ABI boundary while
@@ -209,7 +210,7 @@ impl Socket for UdpSocket {
                                 multicast_source,
                             )?
                             .map(|flow| flow.source),
-                            0,
+                            EMPTY_ROUTE_COOKIE,
                         ),
                         Ipv6(_) => {
                             let resolved = crate::net::route::resolve_ipv6_socket_route(

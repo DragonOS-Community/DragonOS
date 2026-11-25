@@ -46,10 +46,10 @@ impl Probe {
     }
 
     fn can_progress(&self, carrier: bool, dad_ready: bool, skip: bool) -> bool {
-        let link_ready = if self.manual {
+        let link_ready = if self.manual || self.target().is_link_local() {
             dad_ready
         } else {
-            carrier || self.target().is_link_local()
+            carrier
         };
         !self.failed && (link_ready || self.conflict || skip)
     }
@@ -57,11 +57,100 @@ impl Probe {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Setting {
+    Address(AddressSetting),
+    RouterSolicitations,
+    KeepAddrOnDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddressSetting {
     AddrGenMode,
     AcceptDad,
     DadTransmits,
-    RouterSolicitations,
-    KeepAddrOnDown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AddressSettings {
+    mode: i32,
+    accept_dad: i32,
+    dad_transmits: i32,
+}
+
+impl Default for AddressSettings {
+    fn default() -> Self {
+        Self {
+            mode: 0,
+            accept_dad: 1,
+            dad_transmits: 1,
+        }
+    }
+}
+
+impl AddressSettings {
+    pub(crate) fn all_defaults() -> Self {
+        Self {
+            accept_dad: 0,
+            ..Self::default()
+        }
+    }
+    pub(crate) fn get(self, setting: AddressSetting) -> i32 {
+        match setting {
+            AddressSetting::AddrGenMode => self.mode,
+            AddressSetting::AcceptDad => self.accept_dad,
+            AddressSetting::DadTransmits => self.dad_transmits,
+        }
+    }
+    fn set(&mut self, setting: AddressSetting, value: i32) {
+        match setting {
+            AddressSetting::AddrGenMode => self.mode = value,
+            AddressSetting::AcceptDad => self.accept_dad = value,
+            AddressSetting::DadTransmits => self.dad_transmits = value,
+        }
+    }
+}
+
+impl AddressSetting {
+    fn validate(self, value: i32) -> Result<(), SystemError> {
+        match (self, value) {
+            (Self::AddrGenMode, 0 | 1) => Ok(()),
+            (Self::AddrGenMode, 2 | 3) => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
+            (Self::AddrGenMode, _) => Err(SystemError::EINVAL),
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn read_scope(self, netns: &NetNamespace, all: bool) -> i32 {
+        if all {
+            netns.ipv6_all_address_settings.lock().get(self)
+        } else {
+            netns.ipv6_default_address_settings.lock().get(self)
+        }
+    }
+
+    pub(crate) fn write_scope(
+        self,
+        rtnl: &rtnl::RtnlGuard,
+        netns: &Arc<NetNamespace>,
+        all: bool,
+        value: i32,
+    ) -> Result<(), SystemError> {
+        self.validate(value)?;
+        if !all {
+            netns.ipv6_default_address_settings.lock().set(self, value);
+            return Ok(());
+        }
+
+        if self == Self::AddrGenMode {
+            netns.ipv6_default_address_settings.lock().set(self, value);
+            for iface in devices_under_rtnl(rtnl, netns) {
+                if iface.common().ipv6_device_present() {
+                    Setting::Address(self).write(rtnl, netns, &iface, value)?;
+                }
+            }
+        }
+        netns.ipv6_all_address_settings.lock().set(self, value);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,13 +190,11 @@ impl PrefixSettings {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct DeviceState {
     pub(crate) prefixes: PrefixSettings,
     pub(super) solicitation: solicitation::State,
-    mode: i32,
-    accept_dad: i32,
-    dad_transmits: i32,
+    pub(crate) address_settings: AddressSettings,
     pub(crate) keep_addr_on_down: i32,
     ready_seen: bool,
     multicast_initialized: bool,
@@ -116,31 +203,11 @@ pub(crate) struct DeviceState {
     probes: Vec<Probe>,
 }
 
-impl Default for DeviceState {
-    fn default() -> Self {
-        Self {
-            prefixes: PrefixSettings::default(),
-            solicitation: solicitation::State::default(),
-            mode: 0,
-            accept_dad: 1,
-            dad_transmits: 1,
-            keep_addr_on_down: 0,
-            ready_seen: false,
-            multicast_initialized: false,
-            link_ready_latched: false,
-            retry: None,
-            probes: Vec::new(),
-        }
-    }
-}
-
 impl Setting {
     pub(crate) fn read(self, common: &IfaceCommon) -> i32 {
         let state = common.ipv6_autoconf.lock();
         match self {
-            Self::AddrGenMode => state.mode,
-            Self::AcceptDad => state.accept_dad,
-            Self::DadTransmits => state.dad_transmits,
+            Self::Address(setting) => state.address_settings.get(setting),
             Self::RouterSolicitations => state.solicitation.limit,
             Self::KeepAddrOnDown => state.keep_addr_on_down,
         }
@@ -150,13 +217,16 @@ impl Setting {
         self,
         rtnl: &rtnl::RtnlGuard,
         netns: &Arc<NetNamespace>,
-        iface: &dyn Iface,
+        iface: &Arc<dyn Iface>,
         value: i32,
     ) -> Result<(), SystemError> {
         let common = iface.common();
-        if matches!(self, Self::AddrGenMode) && matches!(value, 0 | 1) && self.read(common) != value
+        if let Self::Address(setting) = self {
+            setting.validate(value)?;
+        }
+        if matches!(self, Self::Address(AddressSetting::AddrGenMode)) && self.read(common) != value
         {
-            match crate::net::route::ensure_ipv6_multicast_route(rtnl, netns, iface) {
+            match crate::net::route::ensure_ipv6_multicast_route(rtnl, netns, iface.as_ref()) {
                 Ok(Some(route)) => notify_automatic_ipv6_route(netns, route, false, false),
                 Ok(None) => {}
                 Err(error) => log::warn!(
@@ -168,18 +238,16 @@ impl Setting {
         }
         let mut state = common.ipv6_autoconf.lock();
         match self {
-            Self::AddrGenMode if matches!(value, 0 | 1) => {
-                if state.mode != value {
-                    state.mode = value;
+            Self::Address(setting) => {
+                if state.address_settings.get(setting) == value {
+                    return Ok(());
+                }
+                state.address_settings.set(setting, value);
+                if setting == AddressSetting::AddrGenMode {
                     state.ready_seen = false;
                     state.retry = None;
                 }
             }
-            Self::AddrGenMode if matches!(value, 2 | 3) => {
-                return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
-            }
-            Self::AcceptDad if (-1..=2).contains(&value) => state.accept_dad = value,
-            Self::DadTransmits if value >= 0 => state.dad_transmits = value,
             Self::RouterSolicitations if value >= -1 => state.solicitation.limit = value,
             Self::KeepAddrOnDown => {
                 state.keep_addr_on_down = value;
@@ -188,6 +256,14 @@ impl Setting {
             _ => return Err(SystemError::EINVAL),
         }
         drop(state);
+        if matches!(self, Self::Address(AddressSetting::AddrGenMode))
+            && value == 0
+            && iface.type_() == InterfaceType::ETHER
+            && common.ipv6_device_present()
+            && common.ipv6_enabled()
+        {
+            initialize_link_local(netns, iface, Instant::now().total_micros());
+        }
         changed(common);
         Ok(())
     }
@@ -268,7 +344,10 @@ pub(crate) fn reset_device_state(common: &IfaceCommon, noarp: bool) {
     let mut state = common.ipv6_autoconf.lock();
     debug_assert!(state.probes.is_empty());
     *state = DeviceState {
-        accept_dad: if noarp { -1 } else { 1 },
+        address_settings: AddressSettings {
+            accept_dad: if noarp { -1 } else { 1 },
+            ..AddressSettings::default()
+        },
         ..DeviceState::default()
     };
 }
@@ -299,20 +378,26 @@ pub(super) fn address_from_mac(iface: &dyn Iface, prefix: Ipv6Address) -> Option
     Some(Ipv6Address::from(address))
 }
 
-pub(crate) fn poll(netns: &Arc<NetNamespace>) -> Option<i64> {
-    let rtnl = rtnl::lock();
-    let mut next = None;
+fn devices_under_rtnl<'a>(
+    _rtnl: &'a rtnl::RtnlGuard,
+    netns: &'a NetNamespace,
+) -> impl Iterator<Item = Arc<dyn Iface>> + 'a {
     let mut cursor = 0;
-    loop {
-        let iface = netns
+    core::iter::from_fn(move || {
+        let (index, iface) = netns
             .device_list()
             .range(cursor..)
             .next()
-            .map(|(&index, iface)| (index, iface.clone()));
-        let Some((index, iface)) = iface else {
-            break;
-        };
+            .map(|(&index, iface)| (index, iface.clone()))?;
         cursor = index + 1;
+        Some(iface)
+    })
+}
+
+pub(crate) fn poll(netns: &Arc<NetNamespace>) -> Option<i64> {
+    let rtnl = rtnl::lock();
+    let mut next = None;
+    for iface in devices_under_rtnl(&rtnl, netns) {
         let now = Instant::now().total_micros();
         let lifetime_due = ipv6_lifetime::poll(&rtnl, netns, &iface, now);
         let (dad_due, solicitation_due) = if iface.type_() == InterfaceType::ETHER {
@@ -400,20 +485,16 @@ fn poll_device(
         let state = common.ipv6_autoconf.lock();
         let start = carrier
             && state.multicast_initialized
-            && state.mode == 0
+            && state.address_settings.mode == 0
             && !state.ready_seen
             && state.retry.is_none_or(|due| due <= now);
-        (start, state.accept_dad)
+        (
+            start,
+            effective_accept_dad(netns, state.address_settings.accept_dad),
+        )
     };
     if start {
-        let result = start_address(netns, iface, now);
-        let mut state = common.ipv6_autoconf.lock();
-        state.retry = if matches!(result, Err(SystemError::ENOMEM | SystemError::ENOBUFS)) {
-            Some(now.saturating_add(RETRY_US))
-        } else {
-            state.ready_seen = true;
-            None
-        };
+        initialize_link_local(netns, iface, now);
     }
 
     let resume_due = resume_retained_addresses(rtnl, netns, iface, link_ready, now)
@@ -431,7 +512,7 @@ fn poll_device(
         // A write to accept_dad during an active probe only changes the
         // interface-wide policy for a detected link-local conflict.
         if probe.conflict
-            && accept_dad == 2
+            && accept_dad > 1
             && generated_link_local(iface.as_ref()) == Some(probe.target())
         {
             return super::set_device_ipv6_disabled(rtnl, netns, iface, 1)
@@ -481,7 +562,7 @@ fn resume_retained_addresses(
     dad_ready: bool,
     now: i64,
 ) -> Result<(), SystemError> {
-    let transmits = manual_dad_transmits(iface.as_ref());
+    let transmits = manual_dad_transmits(netns, iface.as_ref());
     if transmits.is_some() && !dad_ready {
         return Ok(());
     }
@@ -521,6 +602,17 @@ fn generated_link_local(iface: &dyn Iface) -> Option<Ipv6Address> {
     address_from_mac(iface, Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0))
 }
 
+fn initialize_link_local(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>, now: i64) {
+    let result = start_address(netns, iface, now);
+    let mut state = iface.common().ipv6_autoconf.lock();
+    state.retry = if matches!(result, Err(SystemError::ENOMEM | SystemError::ENOBUFS)) {
+        Some(now.saturating_add(RETRY_US))
+    } else {
+        state.ready_seen = true;
+        None
+    };
+}
+
 fn start_address(
     netns: &Arc<NetNamespace>,
     iface: &Arc<dyn Iface>,
@@ -556,7 +648,10 @@ pub(super) fn start_address_dad(
     let cidr = IpCidr::Ipv6(address);
     let (accept_dad, transmits) = {
         let state = iface.common().ipv6_autoconf.lock();
-        (state.accept_dad, state.dad_transmits)
+        (
+            effective_accept_dad(netns, state.address_settings.accept_dad),
+            state.address_settings.dad_transmits as u8,
+        )
     };
     let no_dad = accept_dad <= 0 || transmits == 0 || iface.flags().contains(InterfaceFlags::NOARP);
     let state = if no_dad {
@@ -580,12 +675,25 @@ pub(super) fn start_address_dad(
     Ok(())
 }
 
-pub(super) fn manual_dad_transmits(iface: &dyn Iface) -> Option<u32> {
+fn effective_accept_dad(netns: &NetNamespace, per_device: i32) -> i32 {
+    per_device.max(AddressSetting::AcceptDad.read_scope(netns, true))
+}
+
+pub(crate) fn inherited_address_settings(netns: &NetNamespace, no_arp: bool) -> AddressSettings {
+    let mut settings = *netns.ipv6_default_address_settings.lock();
+    if no_arp {
+        settings.accept_dad = -1;
+    }
+    settings
+}
+
+pub(super) fn manual_dad_transmits(netns: &NetNamespace, iface: &dyn Iface) -> Option<u32> {
     if iface.type_() != InterfaceType::ETHER || iface.flags().contains(InterfaceFlags::NOARP) {
         return None;
     }
-    let state = iface.common().ipv6_autoconf.lock();
-    (state.accept_dad > 0).then_some(state.dad_transmits as u32)
+    let settings = iface.common().ipv6_autoconf.lock().address_settings;
+    (effective_accept_dad(netns, settings.accept_dad) > 0)
+        .then_some(u32::from(settings.dad_transmits as u8))
 }
 
 pub(super) fn start_manual_probe(

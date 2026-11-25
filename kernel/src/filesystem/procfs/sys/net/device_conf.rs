@@ -22,7 +22,7 @@ use crate::{
     libs::mutex::MutexGuard,
     net::{
         address::{
-            ipv6_autoconf::{PrefixSetting, Setting},
+            ipv6_autoconf::{AddressSetting, PrefixSetting, Setting},
             set_device_ipv6_disabled,
         },
         rtnl,
@@ -228,12 +228,14 @@ impl DirOps for DeviceDirOps {
             (DeviceConfFamily::Ipv6, "autoconf") => {
                 DeviceField::Ipv6Prefix(PrefixSetting::Autoconf)
             }
-            (DeviceConfFamily::Ipv6, "accept_dad") => DeviceField::Ipv6Autoconf(Setting::AcceptDad),
+            (DeviceConfFamily::Ipv6, "accept_dad") => {
+                DeviceField::Ipv6Autoconf(Setting::Address(AddressSetting::AcceptDad))
+            }
             (DeviceConfFamily::Ipv6, "addr_gen_mode") => {
-                DeviceField::Ipv6Autoconf(Setting::AddrGenMode)
+                DeviceField::Ipv6Autoconf(Setting::Address(AddressSetting::AddrGenMode))
             }
             (DeviceConfFamily::Ipv6, "dad_transmits") => {
-                DeviceField::Ipv6Autoconf(Setting::DadTransmits)
+                DeviceField::Ipv6Autoconf(Setting::Address(AddressSetting::DadTransmits))
             }
             (DeviceConfFamily::Ipv6, "keep_addr_on_down") => {
                 DeviceField::Ipv6Autoconf(Setting::KeepAddrOnDown)
@@ -340,7 +342,7 @@ impl FileOps for DeviceFileOps {
                 }
                 DeviceField::Ipv6AcceptRa => iface.common().set_ipv6_accept_ra(&rtnl, value),
                 DeviceField::Ipv6Autoconf(setting) => {
-                    setting.write(&rtnl, &netns, iface.as_ref(), value)?
+                    setting.write(&rtnl, &netns, &iface, value)?
                 }
                 DeviceField::Ipv6Prefix(setting) => {
                     iface

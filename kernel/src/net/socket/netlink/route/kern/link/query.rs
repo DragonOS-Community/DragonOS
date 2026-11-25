@@ -105,6 +105,13 @@ pub(in crate::net::socket::netlink::route::kern) fn iface_to_link_message(
         }
         attrs.push(LinkAttr::LinkInfo(info));
     }
+    if let Some(mode) = ipv6_autoconf::rtnl_addr_gen_mode(iface.common()) {
+        let mut ipv6 = Vec::new();
+        append_nested_link_attr(&mut ipv6, IFLA_INET6_ADDR_GEN_MODE, &[mode])?;
+        let mut families = Vec::new();
+        append_nested_link_attr(&mut families, AddressFamily::INet6 as u16, &ipv6)?;
+        attrs.push(LinkAttr::AfSpec(families));
+    }
     if let Some(master) = iface.bridge_master() {
         attrs.push(LinkAttr::Master(master.nic_id() as u32));
     }

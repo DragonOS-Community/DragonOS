@@ -6,6 +6,8 @@ use alloc::vec::Vec;
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 
+pub(crate) const IFLA_AF_SPEC: u16 = 26;
+
 #[derive(Debug, Clone, Copy, FromPrimitive, ToPrimitive)]
 #[repr(u16)]
 #[expect(non_camel_case_types)]
@@ -40,7 +42,7 @@ enum LinkAttrClass {
     STATS64 = 23,
     VF_PORTS = 24,
     PORT_SELF = 25,
-    AF_SPEC = 26,
+    AF_SPEC = IFLA_AF_SPEC,
     /// Group the device belongs to
     GROUP = 27,
     NET_NS_FD = 28,
@@ -99,6 +101,7 @@ pub enum LinkAttr {
     Link(u32),
     Master(u32),
     LinkInfo(Vec<u8>),
+    AfSpec(Vec<u8>),
     ProtInfo {
         nested: bool,
         data: Vec<u8>,
@@ -126,6 +129,7 @@ impl LinkAttr {
             LinkAttr::Link(_) => LinkAttrClass::LINK,
             LinkAttr::Master(_) => LinkAttrClass::MASTER,
             LinkAttr::LinkInfo(_) => LinkAttrClass::LINKINFO,
+            LinkAttr::AfSpec(_) => LinkAttrClass::AF_SPEC,
             LinkAttr::ProtInfo { .. } => LinkAttrClass::PROTINFO,
             LinkAttr::NetNsPid(_) => LinkAttrClass::NET_NS_PID,
             LinkAttr::NetNsFd(_) => LinkAttrClass::NET_NS_FD,
@@ -237,6 +241,7 @@ impl Attribute for LinkAttr {
                 core::slice::from_raw_parts(value as *const u32 as *const u8, 4)
             },
             LinkAttr::LinkInfo(data)
+            | LinkAttr::AfSpec(data)
             | LinkAttr::ProtInfo { data, .. }
             | LinkAttr::Unsupported(_, data) => data.as_slice(),
             LinkAttr::Promiscuity(count) | LinkAttr::Allmulti(count) => unsafe {
@@ -278,6 +283,7 @@ impl Attribute for LinkAttr {
                 parse_nested_link_attrs(buf)?;
                 Self::LinkInfo(copy_payload(buf)?)
             }
+            (LinkAttrClass::AF_SPEC, _) => Self::AfSpec(copy_payload(buf)?),
             (LinkAttrClass::PROTINFO, _) => Self::ProtInfo {
                 nested: header.is_nested(),
                 data: copy_payload(buf)?,

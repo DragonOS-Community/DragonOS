@@ -93,6 +93,7 @@ pub(crate) struct LinkMutationCommit {
     pub removed_addresses: Vec<AddressInfo>,
     pub route_changes: Option<RouteNotifications>,
     pub multicast_route: Option<route::RouteEntry>,
+    pub evaluate_ipv6_after_notify: bool,
     pub removed_neighbors: Vec<NeighborEntry>,
     pub rename_old_devpath: Option<String>,
     /// At most one master bridge can be affected by a veth MTU mutation.
@@ -205,7 +206,7 @@ pub(crate) fn mutate_link(
     } else {
         None
     };
-    let initialize_multicast = !prepared.was_up && prepared.is_up
+    let initialize_ipv6 = !prepared.was_up && prepared.is_up
         || prepared.mtu.is_some_and(|mtu| {
             !prepared.iface.common().ipv6_device_present()
                 && prepared.iface.common().ipv6_device_present_at(mtu)
@@ -217,13 +218,13 @@ pub(crate) fn mutate_link(
         committed.related = Some(unsafe { slot.assume_init() });
     }
     // The link and any related bridge FIB candidates are fully published now.
-    // A ready device installs its automatic route before the link ACK.
-    if initialize_multicast {
+    if initialize_ipv6 {
         committed.multicast_route = super::address::ipv6_autoconf::initialize_ready_multicast_route(
             rtnl,
             netns,
             committed.iface.as_ref(),
         );
+        committed.evaluate_ipv6_after_notify = true;
     }
     Ok(committed)
 }
@@ -523,6 +524,7 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
             removed_addresses,
             route_changes,
             multicast_route: None,
+            evaluate_ipv6_after_notify: false,
             removed_neighbors,
             rename_old_devpath,
             related: None,

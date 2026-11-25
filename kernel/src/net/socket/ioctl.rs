@@ -199,7 +199,7 @@ pub(super) fn handle_netdev_mutation(
 
     let rtnl = crate::net::rtnl::lock();
     let committed = crate::net::link::mutate_link(&rtnl, &netns, LinkTarget::Name(name), update)?;
-    super::netlink::notify_link_commit(&netns, committed);
+    super::netlink::notify_link_commit(&rtnl, &netns, committed);
     Ok(0)
 }
 

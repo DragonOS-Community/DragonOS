@@ -87,7 +87,7 @@ struct RouteSpec {
 };
 
 struct DumpedRoute {
-    uint32_t destination = 0;
+    IpBytes destination;
     uint8_t prefix_len = 0;
     uint32_t ifindex = 0;
     bool has_gateway = false;
@@ -378,9 +378,9 @@ int DumpAddresses(int fd, int family, uint32_t sequence, std::vector<DumpedAddre
     }
 }
 
-int DumpRoutes(int fd, uint32_t sequence, std::vector<DumpedRoute>* result) {
+int DumpRoutes(int fd, int family, uint32_t sequence, std::vector<DumpedRoute>* result) {
     auto request = NewRequest<rtmsg>(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, sequence);
-    reinterpret_cast<rtmsg*>(NLMSG_DATA(request.data()))->rtm_family = AF_INET;
+    reinterpret_cast<rtmsg*>(NLMSG_DATA(request.data()))->rtm_family = family;
     if (send(fd, request.data(), request.size(), 0) != static_cast<ssize_t>(request.size())) {
         return errno;
     }
@@ -401,16 +401,18 @@ int DumpRoutes(int fd, uint32_t sequence, std::vector<DumpedRoute>* result) {
             if (header->nlmsg_type != RTM_NEWROUTE) continue;
 
             const auto* message = reinterpret_cast<const rtmsg*>(NLMSG_DATA(header));
-            if (message->rtm_family != AF_INET) continue;
+            if (message->rtm_family != family) continue;
             DumpedRoute route{};
+            route.destination.length = family == AF_INET ? sizeof(in_addr) : sizeof(in6_addr);
             route.prefix_len = message->rtm_dst_len;
             route.kind = message->rtm_type;
             route.table = message->rtm_table;
             int attr_length = RTM_PAYLOAD(header);
             for (auto* attr = RTM_RTA(message); RTA_OK(attr, attr_length);
                  attr = RTA_NEXT(attr, attr_length)) {
-                if (attr->rta_type == RTA_DST && RTA_PAYLOAD(attr) >= sizeof(route.destination)) {
-                    std::memcpy(&route.destination, RTA_DATA(attr), sizeof(route.destination));
+                if (attr->rta_type == RTA_DST && RTA_PAYLOAD(attr) >= route.destination.length) {
+                    std::memcpy(route.destination.bytes.data(), RTA_DATA(attr),
+                                route.destination.length);
                 } else if (attr->rta_type == RTA_OIF &&
                            RTA_PAYLOAD(attr) >= sizeof(route.ifindex)) {
                     std::memcpy(&route.ifindex, RTA_DATA(attr), sizeof(route.ifindex));
@@ -466,10 +468,11 @@ int CountAddressWithoutLabel(int fd, const AddressSpec& expected, uint32_t seque
 
 int CountRoute(int fd, const RouteSpec& expected, uint32_t sequence) {
     std::vector<DumpedRoute> routes;
-    if (const int error = DumpRoutes(fd, sequence, &routes); error != 0) return -error;
+    if (const int error = DumpRoutes(fd, AF_INET, sequence, &routes); error != 0) return -error;
     int count = 0;
     for (const auto& route : routes) {
-        if (route.destination == expected.destination && route.prefix_len == expected.prefix_len &&
+        if (std::memcmp(route.destination.bytes.data(), &expected.destination,
+                        sizeof(expected.destination)) == 0 && route.prefix_len == expected.prefix_len &&
             route.ifindex == expected.ifindex && !route.has_gateway) {
             ++count;
         }
@@ -495,11 +498,19 @@ int CountExplicitBroadcast(int fd, const AddressSpec& expected, uint32_t broadca
     }));
 }
 
+int CountIpv6RoutesOnInterface(int fd, uint32_t ifindex, uint32_t sequence) {
+    std::vector<DumpedRoute> routes;
+    if (const int error = DumpRoutes(fd, AF_INET6, sequence, &routes); error != 0) return -error;
+    return static_cast<int>(std::count_if(routes.begin(), routes.end(), [&](const auto& item) {
+        return item.ifindex == ifindex;
+    }));
+}
+
 int CountBroadcastRoute(int fd, uint32_t ifindex, uint32_t broadcast, uint32_t sequence) {
     std::vector<DumpedRoute> routes;
-    if (const int error = DumpRoutes(fd, sequence, &routes); error != 0) return -error;
+    if (const int error = DumpRoutes(fd, AF_INET, sequence, &routes); error != 0) return -error;
     return static_cast<int>(std::count_if(routes.begin(), routes.end(), [&](const auto& item) {
-        return item.ifindex == ifindex && item.destination == broadcast &&
+        return item.ifindex == ifindex && std::memcmp(item.destination.bytes.data(), &broadcast, sizeof(broadcast)) == 0 &&
                item.prefix_len == 32 && item.kind == RTN_BROADCAST &&
                item.table == RT_TABLE_LOCAL;
     }));
@@ -907,6 +918,87 @@ int RunManualIpv6Dad() {
         usleep(20 * 1000);
     }
     return 3460;
+}
+
+int RunIpv6KeepAddressBelowLoopbackMinimumMtu() {
+    FdGuard fd;
+    uint32_t lo = 0;
+    uint32_t sequence = 9000;
+    if (const int error = PrepareNamespace(&fd, &lo, &sequence); error != 0) return error;
+
+    auto set_keep = [](const char (&value)[3]) {
+        FdGuard setting(open("/proc/sys/net/ipv6/conf/lo/keep_addr_on_down", O_WRONLY));
+        return setting.Get() >= 0 && write(setting.Get(), value, 2) == 2;
+    };
+    const auto usable = MakeAddress(AF_INET6, "fd90::1", 64, lo);
+    const auto without_nodad = MakeAddress(AF_INET6, "fd90::2", 64, lo);
+    const auto finite = MakeAddress(AF_INET6, "fd90::3", 64, lo);
+    const auto localhost = MakeAddress(AF_INET6, "::1", 128, lo);
+    const auto ipv4 = MakeAddress(AF_INET, "198.18.90.1", 24, lo);
+    constexpr uint16_t create = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    constexpr ifa_cacheinfo lifetime{30, 40, 0, 0};
+    auto add = [&](const AddressSpec& spec, std::optional<uint32_t> flags, const ifa_cacheinfo* cache = nullptr) {
+        return ChangeAddress(fd.Get(), RTM_NEWADDR, create, spec, true, true, ++sequence, nullptr,
+                             std::nullopt, nullptr, flags, cache);
+    };
+    if (!set_keep("1\n") || add(usable, IFA_F_NODAD) != 0 || add(without_nodad, 0) != 0 ||
+        add(finite, IFA_F_NODAD, &lifetime) != 0 || add(ipv4, std::nullopt) != 0) {
+        return 100;
+    }
+    auto wait_until_bindable = [](const AddressSpec& address) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        do {
+            if (BindUdp(address, 0) == 0) return true;
+            usleep(10000);
+        } while (std::chrono::steady_clock::now() < until);
+        return false;
+    };
+    if (!wait_until_bindable(without_nodad) || CountIpv6RoutesOnInterface(fd.Get(), lo, ++sequence) <= 0) {
+        return 110;
+    }
+    auto retained = [&](bool require_tentative) {
+        if (CountAddress(fd.Get(), usable, ++sequence) != 1) return 1;
+        if (CountAddress(fd.Get(), without_nodad, ++sequence) != 1) return 2;
+        if (CountAddress(fd.Get(), finite, ++sequence) != 0) return 3;
+        if (CountAddress(fd.Get(), localhost, ++sequence) != 0) return 4;
+        if (CountAddress(fd.Get(), ipv4, ++sequence) != 1) return 5;
+        if (BindUdp(usable, 0) != 0) return 6;
+        if (require_tentative && BindUdp(without_nodad, 0) != EADDRNOTAVAIL) return 7;
+        if (CountIpv6RoutesOnInterface(fd.Get(), lo, ++sequence) != 0) return 8;
+        return 0;
+    };
+    if (SetLinkMtu(fd.Get(), lo, 1279, ++sequence) != 0) return 200;
+    if (const int error = retained(true); error != 0) return 200 + error;
+    if (SetLinkUp(fd.Get(), lo, ++sequence, false) != 0 ||
+        SetLinkUp(fd.Get(), lo, ++sequence) != 0) {
+        return 300;
+    }
+    // Linux can complete a no-ARP DAD worker around low-MTU link-up.
+    // Retained address presence and absence of ::1 are stable here.
+    if (const int error = retained(false); error != 0) return 300 + error;
+    if (SetLinkMtu(fd.Get(), lo, 1280, ++sequence) != 0) return 400;
+    if (const int error = retained(false); error != 0) return 400 + error;
+    if (SetLinkUp(fd.Get(), lo, ++sequence, false) != 0 ||
+        SetLinkUp(fd.Get(), lo, ++sequence) != 0) {
+        return 500;
+    }
+    if (!wait_until_bindable(without_nodad)) return 501;
+    if (CountAddress(fd.Get(), localhost, ++sequence) != 1 || BindUdp(usable, 0) != 0 ||
+        CountIpv6RoutesOnInterface(fd.Get(), lo, ++sequence) <= 0) {
+        return 502;
+    }
+    if (SetLinkMtu(fd.Get(), lo, 1279, ++sequence) != 0 ||
+        !set_keep("0\n") || SetLinkMtu(fd.Get(), lo, 1279, ++sequence) != 0) {
+        return 600;
+    }
+    if (const int error = retained(true); error != 0) return 600 + error;
+    if (SetLinkMtu(fd.Get(), lo, 1278, ++sequence) != 0 ||
+        CountAddress(fd.Get(), usable, ++sequence) != 0 ||
+        CountAddress(fd.Get(), without_nodad, ++sequence) != 0 ||
+        CountAddress(fd.Get(), ipv4, ++sequence) != 1) {
+        return 700;
+    }
+    return 0;
 }
 
 int RunIpv6KeepAddressOnDown() {
@@ -2014,6 +2106,11 @@ TEST(RtnetlinkAddressSemantics, ManualIpv6DadHonorsFlagsAndLinkReadiness) {
 TEST(RtnetlinkAddressSemantics, Ipv6KeepAddressOnDownRestoresPermanentAddresses) {
     ExpectSuccessfulChild(RunWithWatchdog(RunIpv6KeepAddressOnDown),
                           "IPv6 address retention through administrative down hung");
+}
+
+TEST(RtnetlinkAddressSemantics, Ipv6KeepAddressBelowLoopbackMinimumMtu) {
+    ExpectSuccessfulChild(RunWithWatchdog(RunIpv6KeepAddressBelowLoopbackMinimumMtu),
+                          "IPv6 loopback address retention on MTU change hung");
 }
 
 TEST(RtnetlinkAddressSemantics, FiniteIpv6DadFailureDeletesAddressWithFailureFlags) {

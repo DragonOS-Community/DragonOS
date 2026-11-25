@@ -201,6 +201,7 @@ pub(crate) fn set_device_ipv6_disabled(
             is_up: up,
             ipv6_enabled: Some(enabled),
             discard_learned_defaults: false,
+            withdraw_ipv6_routes: false,
         },
     )?;
     let neighbors = if enabled {
@@ -544,20 +545,24 @@ pub(in crate::net) fn prepare_link_address_change(
 ) -> Result<Option<PreparedLinkAddressChange>, SystemError> {
     let link_up = is_up && !was_up;
     let link_down = was_up && !is_up;
-    let loopback_up = link_up
-        && iface.common().ipv6_enabled()
-        && iface.flags().contains(InterfaceFlags::LOOPBACK);
+    let loopback = iface.flags().contains(InterfaceFlags::LOOPBACK);
+    let current_mtu = iface.mtu();
+    let effective_mtu = mtu.unwrap_or(current_mtu);
+    let restore_ipv6_addresses = link_up && effective_mtu >= IPV6_MIN_MTU;
+    let withdraw_ipv6_routes =
+        loopback && effective_mtu < IPV6_MIN_MTU && (mtu.is_some() || link_up);
+    let reset_ipv6_addresses = link_down || withdraw_ipv6_routes;
     if mtu.is_none() && !link_up && !link_down {
         return Ok(None);
     }
     let (has_ipv6_metadata, retained_count) = {
         let metadata = iface.common().address_metadata().lock();
         (
-            link_down
+            reset_ipv6_addresses
                 && metadata
                     .iter()
                     .any(|entry| matches!(entry.cidr, IpCidr::Ipv6(_))),
-            if link_up {
+            if restore_ipv6_addresses {
                 metadata
                     .iter()
                     .filter(|entry| matches!(entry.state, AddressState::Retained(_)))
@@ -568,10 +573,10 @@ pub(in crate::net) fn prepare_link_address_change(
         )
     };
     let mirror = iface.router_common().ip_addrs.read();
-    let remove_ipv6_addresses = link_down
+    let remove_ipv6_addresses = reset_ipv6_addresses
         && (has_ipv6_metadata || mirror.iter().any(|cidr| matches!(cidr, IpCidr::Ipv6(_))));
-    let restored = if loopback_up {
-        missing_loopback_ipv6_address(iface, mtu.unwrap_or_else(|| iface.mtu()), &mirror)
+    let restored = if loopback && restore_ipv6_addresses && iface.common().ipv6_enabled() {
+        missing_loopback_ipv6_address(iface, effective_mtu, &mirror)
     } else {
         None
     };
@@ -582,8 +587,9 @@ pub(in crate::net) fn prepare_link_address_change(
         })
     };
     let discard_learned_defaults =
-        mtu.is_some_and(|mtu| mtu < IPV6_MIN_MTU && iface.mtu() >= IPV6_MIN_MTU);
+        mtu.is_some_and(|mtu| mtu < IPV6_MIN_MTU && current_mtu >= IPV6_MIN_MTU);
     if !discard_learned_defaults
+        && !withdraw_ipv6_routes
         && !remove_ipv6_addresses
         && restored.is_none()
         && retained_count == 0
@@ -603,7 +609,7 @@ pub(in crate::net) fn prepare_link_address_change(
     let keep_addr_on_down = netns.ipv6_all_keep_addr_on_down();
     let keep_addresses = remove_ipv6_addresses
         && iface.common().ipv6_enabled()
-        && mtu.unwrap_or_else(|| iface.mtu()) >= IPV6_MIN_MTU
+        && (loopback || effective_mtu >= IPV6_MIN_MTU)
         && if keep_addr_on_down != 0 {
             keep_addr_on_down > 0
         } else {
@@ -615,11 +621,7 @@ pub(in crate::net) fn prepare_link_address_change(
                 continue;
             };
             let address = cidr.address();
-            if !entry.ipv6_permanent
-                || address.is_unicast_link_local()
-                || address.is_loopback()
-                || mtu_removal(entry.cidr)
-            {
+            if !entry.ipv6_permanent || address.is_unicast_link_local() || address.is_loopback() {
                 continue;
             }
             let state = match entry.state {
@@ -661,7 +663,7 @@ pub(in crate::net) fn prepare_link_address_change(
         after.push(cidr);
         changed_addresses.push(cidr);
     }
-    if link_up {
+    if restore_ipv6_addresses {
         let ethernet = iface.type_() == crate::driver::net::types::InterfaceType::ETHER;
         let now = crate::time::Instant::now().total_micros();
         for entry in &mut metadata {
@@ -689,6 +691,7 @@ pub(in crate::net) fn prepare_link_address_change(
         is_up,
         ipv6_enabled: None,
         discard_learned_defaults,
+        withdraw_ipv6_routes,
     };
     let routes = match staged_before {
         Some(staged) => {
@@ -1030,6 +1033,7 @@ fn commit_published(
             is_up,
             ipv6_enabled: None,
             discard_learned_defaults: false,
+            withdraw_ipv6_routes: false,
         },
     )?;
     if let Some((address, transmits)) = manual_probe {
@@ -1107,6 +1111,7 @@ fn prepare_automatic_address(
             is_up: up,
             ipv6_enabled: None,
             discard_learned_defaults: false,
+            withdraw_ipv6_routes: false,
         },
     )
 }

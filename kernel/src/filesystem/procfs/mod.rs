@@ -47,9 +47,10 @@ mod vmstat;
 pub use root::ProcFS;
 
 /// procfs 的 inode 名称的最大长度
-pub(super) const PROCFS_MAX_NAMELEN: usize = 64;
+pub(super) const PROCFS_MAX_NAMELEN: usize = crate::filesystem::vfs::NAME_MAX;
 /// procfs 的块大小
-pub(super) const PROCFS_BLOCK_SIZE: u64 = 512;
+pub(super) const PROCFS_BLOCK_SIZE: u64 =
+    <crate::arch::MMArch as crate::mm::MemoryManagementArch>::PAGE_SIZE as u64;
 
 /// 供 template 使用的 Builder trait
 pub(super) use template::Builder;

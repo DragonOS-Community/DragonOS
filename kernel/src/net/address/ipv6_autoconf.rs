@@ -2,6 +2,7 @@
 //! changes. The receive path only latches a conflict against a live probe.
 
 use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     Icmpv6Packet, Icmpv6Repr, IpCidr, IpProtocol, IpVersion, Ipv6Address, Ipv6AddressExt, Ipv6Cidr,
@@ -24,7 +25,13 @@ use crate::net::{
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::time::Instant;
 
-use super::{ipv6_lifetime, ipv6_router_solicitation as solicitation};
+use super::{ipv6_lifetime, ipv6_router_solicitation as solicitation, ipv6_stable_id};
+
+const MODE_EUI64: i32 = 0;
+const MODE_NONE: i32 = 1;
+const MODE_STABLE_PRIVACY: i32 = 2;
+const MODE_RANDOM: i32 = 3;
+const LINK_LOCAL_PREFIX: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
 
 const RETRANS_US: i64 = 1_000_000;
 pub(super) const RETRY_US: i64 = 100_000;
@@ -36,6 +43,7 @@ struct Probe {
     nonce: [u8; 6],
     due: i64,
     remaining: u32,
+    joined: bool,
     conflict: bool,
     failed: bool,
 }
@@ -69,20 +77,32 @@ pub(crate) enum AddressSetting {
     DadTransmits,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct AddressSettings {
     mode: i32,
     accept_dad: i32,
     dad_transmits: i32,
+    stable_secret: Option<[u8; 16]>,
 }
 
 impl Default for AddressSettings {
     fn default() -> Self {
         Self {
-            mode: 0,
+            mode: MODE_EUI64,
             accept_dad: 1,
             dad_transmits: 1,
+            stable_secret: None,
         }
+    }
+}
+
+impl core::fmt::Debug for AddressSettings {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AddressSettings")
+            .field("mode", &self.mode)
+            .field("accept_dad", &self.accept_dad)
+            .field("dad_transmits", &self.dad_transmits)
+            .finish_non_exhaustive()
     }
 }
 
@@ -111,12 +131,10 @@ impl AddressSettings {
 
 impl AddressSetting {
     pub(crate) fn validate(self, value: i32) -> Result<(), SystemError> {
-        match (self, value) {
-            (Self::AddrGenMode, 0 | 1) => Ok(()),
-            (Self::AddrGenMode, 2 | 3) => Err(SystemError::EOPNOTSUPP_OR_ENOTSUP),
-            (Self::AddrGenMode, _) => Err(SystemError::EINVAL),
-            _ => Ok(()),
+        if self == Self::AddrGenMode && !(MODE_EUI64..=MODE_RANDOM).contains(&value) {
+            return Err(SystemError::EINVAL);
         }
+        Ok(())
     }
 
     pub(crate) fn read_scope(self, netns: &NetNamespace, all: bool) -> i32 {
@@ -144,7 +162,7 @@ impl AddressSetting {
             netns.ipv6_default_address_settings.lock().set(self, value);
             for iface in devices_under_rtnl(rtnl, netns) {
                 if iface.common().ipv6_device_present() {
-                    Setting::Address(self).write(rtnl, netns, &iface, value)?;
+                    Setting::Address(self).apply(rtnl, netns, &iface, value)?;
                 }
             }
         }
@@ -220,10 +238,23 @@ impl Setting {
         iface: &Arc<dyn Iface>,
         value: i32,
     ) -> Result<(), SystemError> {
-        let common = iface.common();
         if let Self::Address(setting) = self {
             setting.validate(value)?;
+            if setting == AddressSetting::AddrGenMode {
+                validate_stable_mode(netns, iface.common(), value)?;
+            }
         }
+        self.apply(rtnl, netns, iface, value)
+    }
+
+    fn apply(
+        self,
+        rtnl: &rtnl::RtnlGuard,
+        netns: &Arc<NetNamespace>,
+        iface: &Arc<dyn Iface>,
+        value: i32,
+    ) -> Result<(), SystemError> {
+        let common = iface.common();
         if matches!(self, Self::Address(AddressSetting::AddrGenMode)) && self.read(common) != value
         {
             match crate::net::route::ensure_ipv6_multicast_route(rtnl, netns, iface.as_ref()) {
@@ -257,7 +288,7 @@ impl Setting {
         }
         drop(state);
         if matches!(self, Self::Address(AddressSetting::AddrGenMode))
-            && value == 0
+            && value != MODE_NONE
             && iface.type_() == InterfaceType::ETHER
             && common.ipv6_device_present()
             && common.ipv6_enabled()
@@ -285,6 +316,52 @@ pub(crate) fn set_rtnl_addr_gen_mode(
     }
     common.ipv6_autoconf.lock().address_settings.mode = i32::from(mode);
     Ok(())
+}
+
+pub(crate) fn validate_stable_mode(
+    netns: &NetNamespace,
+    common: &IfaceCommon,
+    mode: i32,
+) -> Result<(), SystemError> {
+    if mode == MODE_STABLE_PRIVACY && stable_secret(netns, common).is_none() {
+        return Err(SystemError::EINVAL);
+    }
+    Ok(())
+}
+
+fn stable_secret(netns: &NetNamespace, common: &IfaceCommon) -> Option<[u8; 16]> {
+    device_stable_secret(common).or_else(|| default_stable_secret(netns))
+}
+
+pub(crate) fn device_stable_secret(common: &IfaceCommon) -> Option<[u8; 16]> {
+    common.ipv6_autoconf.lock().address_settings.stable_secret
+}
+
+pub(crate) fn default_stable_secret(netns: &NetNamespace) -> Option<[u8; 16]> {
+    netns.ipv6_default_address_settings.lock().stable_secret
+}
+
+pub(crate) fn set_device_stable_secret(
+    _rtnl: &rtnl::RtnlGuard,
+    common: &IfaceCommon,
+    secret: [u8; 16],
+) {
+    let mut state = common.ipv6_autoconf.lock();
+    state.address_settings.stable_secret = Some(secret);
+    state.address_settings.mode = MODE_STABLE_PRIVACY;
+}
+
+pub(crate) fn set_default_stable_secret(
+    rtnl: &rtnl::RtnlGuard,
+    netns: &NetNamespace,
+    secret: [u8; 16],
+) {
+    netns.ipv6_default_address_settings.lock().stable_secret = Some(secret);
+    for iface in devices_under_rtnl(rtnl, netns) {
+        if iface.common().ipv6_device_present() {
+            iface.common().ipv6_autoconf.lock().address_settings.mode = MODE_STABLE_PRIVACY;
+        }
+    }
 }
 
 pub(crate) fn changed(common: &IfaceCommon) {
@@ -322,7 +399,11 @@ pub(crate) fn cancel(common: &IfaceCommon) {
         core::mem::take(&mut state.probes)
     };
     if let Some(netns) = common.net_namespace() {
-        for target in probes.into_iter().map(|probe| probe.target()) {
+        for target in probes
+            .into_iter()
+            .filter(|probe| probe.joined)
+            .map(|probe| probe.target())
+        {
             let _ = common.multicast_leave_ref(&netns, target.solicited_node().into());
         }
         netns.notify_ipv6_autoconf();
@@ -332,22 +413,17 @@ pub(crate) fn cancel(common: &IfaceCommon) {
 pub(super) fn cancel_target(common: &IfaceCommon, target: Ipv6Address) {
     let joined = {
         let mut state = common.ipv6_autoconf.lock();
-        if let Some(index) = state
+        state
             .probes
             .iter()
             .position(|probe| probe.target() == target)
-        {
-            state.probes.remove(index);
-            true
-        } else {
-            false
-        }
+            .map(|index| state.probes.remove(index).joined)
     };
-    if joined {
-        if let Some(netns) = common.net_namespace() {
+    if let (Some(joined), Some(netns)) = (joined, common.net_namespace()) {
+        if joined {
             let _ = common.multicast_leave_ref(&netns, target.solicited_node().into());
-            netns.notify_ipv6_autoconf();
         }
+        netns.notify_ipv6_autoconf();
     }
 }
 
@@ -542,18 +618,33 @@ fn poll_device(
             index += 1;
             continue;
         }
-        // A write to accept_dad during an active probe only changes the
-        // interface-wide policy for a detected link-local conflict.
-        if probe.conflict
-            && accept_dad > 1
-            && generated_link_local(iface.as_ref()) == Some(probe.target())
-        {
-            return super::set_device_ipv6_disabled(rtnl, netns, iface, 1)
-                .err()
-                .map(|_| now.saturating_add(RETRY_US));
+        if !probe.joined {
+            if probe.due <= now {
+                if let Some(transmits) = automatic_dad_transmits(netns, iface.as_ref()) {
+                    if common
+                        .multicast_join_ref(netns, probe.target().solicited_node().into())
+                        .is_err()
+                    {
+                        return Some(now.saturating_add(RETRY_US));
+                    }
+                    let mut state = common.ipv6_autoconf.lock();
+                    let current = &mut state.probes[index];
+                    current.joined = true;
+                    current.remaining = u32::from(transmits);
+                    current.due = now.saturating_add(probe_jitter(probe.nonce));
+                } else {
+                    match finish_address(rtnl, netns, iface, index, probe, accept_dad) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(_) => return Some(now.saturating_add(RETRY_US)),
+                    }
+                }
+            }
+            index += 1;
+            continue;
         }
         if probe.conflict || skip || (probe.remaining == 0 && probe.due <= now) {
-            match finish_address(rtnl, netns, iface, index, probe) {
+            match finish_address(rtnl, netns, iface, index, probe, accept_dad) {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(_) => return Some(now.saturating_add(RETRY_US)),
@@ -607,11 +698,11 @@ fn resume_retained_addresses(
             .iter()
             .find_map(|entry| match (entry.cidr, entry.state) {
                 (IpCidr::Ipv6(cidr), AddressState::Retained(state)) => {
-                    Some((cidr, state, entry.lifetimes))
+                    Some((cidr, state, entry.lifetimes, entry.ipv6_stable_dad_count))
                 }
                 _ => None,
             });
-        let Some((ipv6, retained_dad, lifetimes)) = retained else {
+        let Some((ipv6, retained_dad, lifetimes, stable_dad_count)) = retained else {
             return Ok(());
         };
         let cidr = IpCidr::Ipv6(ipv6);
@@ -619,20 +710,27 @@ fn resume_retained_addresses(
             Some(_) => (AddressState::ManualDad(retained_dad), DadState::Tentative),
             None => (AddressState::Configured, DadState::Usable),
         };
-        let prepared = super::prepare_automatic_address(netns, iface, cidr, state, lifetimes)?;
+        let prepared = super::prepare_automatic_address(
+            netns,
+            iface,
+            cidr,
+            state,
+            lifetimes,
+            stable_dad_count,
+        )?;
         if lifetimes.is_some_and(|lifetime| lifetime.expired(Instant::now().total_micros())) {
             ipv6_lifetime::remove(rtnl, netns, iface, cidr, None)?;
             continue;
         }
         if let Some(transmits) = transmits {
-            start_probe(netns, iface.common(), ipv6, transmits, now, true)?;
+            start_probe(netns, iface.common(), ipv6, transmits, now, true, None)?;
         }
         publish_address(netns, iface, cidr, dad, prepared);
     }
 }
 
 fn generated_link_local(iface: &dyn Iface) -> Option<Ipv6Address> {
-    address_from_mac(iface, Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0))
+    address_from_mac(iface, LINK_LOCAL_PREFIX)
 }
 
 fn evaluate_ready_link_local(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>, now: i64) {
@@ -641,7 +739,7 @@ fn evaluate_ready_link_local(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>, 
     {
         return;
     }
-    if state.address_settings.mode != 0 {
+    if state.address_settings.mode == MODE_NONE {
         state.ready_seen = true;
         state.retry = None;
         return;
@@ -653,7 +751,10 @@ fn evaluate_ready_link_local(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>, 
 fn initialize_link_local(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>, now: i64) {
     let result = start_address(netns, iface, now);
     let mut state = iface.common().ipv6_autoconf.lock();
-    state.retry = if matches!(result, Err(SystemError::ENOMEM | SystemError::ENOBUFS)) {
+    state.retry = if matches!(
+        result,
+        Err(SystemError::ENOMEM | SystemError::ENOBUFS | SystemError::EAGAIN_OR_EWOULDBLOCK)
+    ) {
         Some(now.saturating_add(RETRY_US))
     } else {
         state.ready_seen = true;
@@ -661,29 +762,85 @@ fn initialize_link_local(netns: &Arc<NetNamespace>, iface: &Arc<dyn Iface>, now:
     };
 }
 
-fn start_address(
-    netns: &Arc<NetNamespace>,
-    iface: &Arc<dyn Iface>,
-    now: i64,
-) -> Result<(), SystemError> {
-    let Some(target) = generated_link_local(iface.as_ref()) else {
-        return Ok(());
-    };
-    if super::iface_has_address(iface, target.into())
+fn stable_address(
+    netns: &NetNamespace,
+    iface: &dyn Iface,
+    prefix: Ipv6Address,
+    dad_count: u8,
+) -> Option<Ipv6Address> {
+    let secret = stable_secret(netns, iface.common())?;
+    let mut address = prefix.octets();
+    let id = ipv6_stable_id::interface_id(
+        address[..8].try_into().unwrap(),
+        &secret,
+        &iface.permanent_mac(),
+        dad_count,
+        netns.ipv6_idgen_retries.load(Ordering::Acquire),
+    )?;
+    address[8..].copy_from_slice(&id);
+    Some(Ipv6Address::from(address))
+}
+
+pub(super) fn slaac_candidate(
+    netns: &NetNamespace,
+    iface: &dyn Iface,
+    prefix: Ipv6Address,
+) -> Option<(Ipv6Address, Option<u8>)> {
+    let mode = iface.common().ipv6_autoconf.lock().address_settings.mode;
+    if matches!(mode, MODE_STABLE_PRIVACY | MODE_RANDOM) {
+        if let Some(address) = stable_address(netns, iface, prefix, 0) {
+            return Some((address, Some(0)));
+        }
+    }
+    address_from_mac(iface, prefix).map(|address| (address, None))
+}
+
+fn address_exists(iface: &Arc<dyn Iface>, target: Ipv6Address) -> bool {
+    super::iface_has_address(iface, target.into())
         || iface
             .common()
             .address_metadata()
             .lock()
             .iter()
-            .any(|entry| {
-                entry.cidr.address() == target.into()
-                    || matches!(entry.state, AddressState::AutoLinkLocal(_))
-            })
-    {
+            .any(|entry| entry.cidr.address() == target.into())
+}
+
+fn start_address(
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    now: i64,
+) -> Result<(), SystemError> {
+    let common = iface.common();
+    let mode = common.ipv6_autoconf.lock().address_settings.mode;
+    if mode == MODE_RANDOM && device_stable_secret(common).is_none() {
+        let mut secret = [0; 16];
+        crate::libs::rand::secure_random_bytes(&mut secret)?;
+        common.ipv6_autoconf.lock().address_settings.stable_secret = Some(secret);
+    }
+    let (target, stable_dad_count) = match mode {
+        MODE_EUI64 => (generated_link_local(iface.as_ref()), None),
+        MODE_STABLE_PRIVACY | MODE_RANDOM => (
+            stable_address(netns, iface.as_ref(), LINK_LOCAL_PREFIX, 0),
+            Some(0),
+        ),
+        _ => return Ok(()),
+    };
+    let Some(target) = target else {
+        return Ok(());
+    };
+    if address_exists(iface, target) {
         return Ok(());
     }
 
-    start_address_dad(netns, iface, Ipv6Cidr::new(target, 64), None, now)
+    start_address_dad(
+        netns,
+        iface,
+        Ipv6Cidr::new(target, 64),
+        None,
+        stable_dad_count,
+        now,
+        None,
+    )
 }
 
 pub(super) fn start_address_dad(
@@ -691,18 +848,13 @@ pub(super) fn start_address_dad(
     iface: &Arc<dyn Iface>,
     address: Ipv6Cidr,
     lifetimes: Option<ipv6_lifetime::Lifetimes>,
+    stable_dad_count: Option<u8>,
     now: i64,
+    delay: Option<i64>,
 ) -> Result<(), SystemError> {
     let cidr = IpCidr::Ipv6(address);
-    let (accept_dad, transmits) = {
-        let state = iface.common().ipv6_autoconf.lock();
-        (
-            effective_accept_dad(netns, state.address_settings.accept_dad),
-            state.address_settings.dad_transmits as u8,
-        )
-    };
-    let no_dad = accept_dad <= 0 || transmits == 0 || iface.flags().contains(InterfaceFlags::NOARP);
-    let state = if no_dad {
+    let transmits = automatic_dad_transmits(netns, iface.as_ref());
+    let state = if transmits.is_none() && delay.is_none() {
         DadState::Usable
     } else {
         DadState::Tentative
@@ -712,15 +864,32 @@ pub(super) fn start_address_dad(
     } else {
         AddressState::AutoLinkLocal(state)
     };
-    let prepared = super::prepare_automatic_address(netns, iface, cidr, address_state, lifetimes)?;
+    let prepared = super::prepare_automatic_address(
+        netns,
+        iface,
+        cidr,
+        address_state,
+        lifetimes,
+        stable_dad_count,
+    )?;
     if lifetimes.is_some_and(|lifetimes| lifetimes.expired(Instant::now().total_micros())) {
         return Ok(());
     }
-    if !no_dad {
-        start_probe(netns, iface.common(), address, transmits as u32, now, false)?;
+    if state == DadState::Tentative {
+        let transmits = u32::from(transmits.unwrap_or_default());
+        start_probe(netns, iface.common(), address, transmits, now, false, delay)?;
     }
     publish_address(netns, iface, cidr, state, prepared);
     Ok(())
+}
+
+fn automatic_dad_transmits(netns: &NetNamespace, iface: &dyn Iface) -> Option<u8> {
+    let settings = iface.common().ipv6_autoconf.lock().address_settings;
+    let count = settings.dad_transmits as u8;
+    (count != 0
+        && !iface.flags().contains(InterfaceFlags::NOARP)
+        && effective_accept_dad(netns, settings.accept_dad) > 0)
+        .then_some(count)
 }
 
 fn effective_accept_dad(netns: &NetNamespace, per_device: i32) -> i32 {
@@ -729,6 +898,9 @@ fn effective_accept_dad(netns: &NetNamespace, per_device: i32) -> i32 {
 
 pub(crate) fn inherited_address_settings(netns: &NetNamespace, no_arp: bool) -> AddressSettings {
     let mut settings = *netns.ipv6_default_address_settings.lock();
+    if settings.stable_secret.is_some() {
+        settings.mode = MODE_STABLE_PRIVACY;
+    }
     if no_arp {
         settings.accept_dad = -1;
     }
@@ -757,6 +929,7 @@ pub(super) fn start_manual_probe(
         transmits,
         Instant::now().total_micros(),
         true,
+        None,
     )
 }
 
@@ -767,6 +940,7 @@ fn start_probe(
     transmits: u32,
     now: i64,
     manual: bool,
+    delay: Option<i64>,
 ) -> Result<(), SystemError> {
     common
         .ipv6_autoconf
@@ -774,24 +948,62 @@ fn start_probe(
         .probes
         .try_reserve(1)
         .map_err(|_| SystemError::ENOMEM)?;
-    common.multicast_join_ref(netns, address.address().solicited_node().into())?;
+    let joined = delay.is_none();
+    if joined {
+        common.multicast_join_ref(netns, address.address().solicited_node().into())?;
+    }
     let mut nonce = [0; 6];
     while nonce == [0; 6] {
         crate::libs::rand::fill_random_bytes(&mut nonce);
     }
-    // Spread first probes when several addresses become ready together.
-    let jitter =
-        i64::from(u32::from_be_bytes([nonce[0], nonce[1], nonce[2], nonce[3]])) % RETRANS_US;
     common.ipv6_autoconf.lock().probes.push(Probe {
         address,
         manual,
         nonce,
-        due: now.saturating_add(jitter),
+        due: now.saturating_add(delay.unwrap_or_else(|| probe_jitter(nonce))),
         remaining: transmits,
+        joined,
         conflict: false,
         failed: false,
     });
     Ok(())
+}
+
+fn probe_jitter(nonce: [u8; 6]) -> i64 {
+    // Spread first probes when several addresses become ready together.
+    i64::from(u32::from_be_bytes([nonce[0], nonce[1], nonce[2], nonce[3]])) % RETRANS_US
+}
+
+fn queue_stable_retry(
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    address: Ipv6Cidr,
+    previous_count: u8,
+    lifetimes: Option<ipv6_lifetime::Lifetimes>,
+) -> Result<(), SystemError> {
+    let Some(count) = previous_count
+        .checked_add(1)
+        .filter(|&count| i32::from(count) <= netns.ipv6_idgen_retries.load(Ordering::Acquire))
+    else {
+        return Ok(());
+    };
+    let Some(candidate) = stable_address(netns, iface.as_ref(), address.address(), count) else {
+        return Ok(());
+    };
+    if address_exists(iface, candidate) {
+        return Ok(());
+    }
+    let now = Instant::now().total_micros();
+    let delay = i64::from(netns.ipv6_idgen_delay.load(Ordering::Acquire).max(0)) * 1_000_000;
+    start_address_dad(
+        netns,
+        iface,
+        Ipv6Cidr::new(candidate, address.prefix_len()),
+        lifetimes.map(|lifetimes| lifetimes.restart_for_dad(now)),
+        Some(count),
+        now,
+        Some(delay),
+    )
 }
 
 fn finish_address(
@@ -800,6 +1012,7 @@ fn finish_address(
     iface: &Arc<dyn Iface>,
     index: usize,
     observed: Probe,
+    accept_dad: i32,
 ) -> Result<bool, SystemError> {
     let cidr = IpCidr::Ipv6(observed.address);
     let state = if observed.conflict {
@@ -807,14 +1020,32 @@ fn finish_address(
     } else {
         DadState::Usable
     };
-    let (old_state, lifetimes, permanent) = iface
+    let (old_state, lifetimes, permanent, stable_dad_count) = iface
         .common()
         .address_metadata()
         .lock()
         .iter()
         .find(|entry| entry.cidr == cidr)
-        .map(|entry| (entry.state, entry.lifetimes, entry.ipv6_permanent))
+        .map(|entry| {
+            (
+                entry.state,
+                entry.lifetimes,
+                entry.ipv6_permanent,
+                entry.ipv6_stable_dad_count,
+            )
+        })
         .ok_or(SystemError::EADDRNOTAVAIL)?;
+    if observed.conflict {
+        if let Some(count) = stable_dad_count {
+            // A failed allocation for the next candidate must not leave the
+            // duplicate address waiting indefinitely in its old DAD attempt.
+            let _ = queue_stable_retry(netns, iface, observed.address, count, lifetimes);
+        } else if accept_dad > 1 && generated_link_local(iface.as_ref()) == Some(observed.target())
+        {
+            super::set_device_ipv6_disabled(rtnl, netns, iface, 1)?;
+            return Ok(true);
+        }
+    }
     let address_state = match old_state {
         AddressState::Slaac(_) => AddressState::Slaac(state),
         AddressState::ManualDad(_) if state == DadState::Usable => AddressState::Configured,
@@ -825,7 +1056,14 @@ fn finish_address(
         ipv6_lifetime::remove(rtnl, netns, iface, cidr, Some(address_state))?;
         return Ok(true);
     }
-    let prepared = super::prepare_automatic_address(netns, iface, cidr, address_state, lifetimes)?;
+    let prepared = super::prepare_automatic_address(
+        netns,
+        iface,
+        cidr,
+        address_state,
+        lifetimes,
+        stable_dad_count,
+    )?;
     if lifetimes.is_some_and(|lifetimes| lifetimes.expired(Instant::now().total_micros())) {
         ipv6_lifetime::remove(rtnl, netns, iface, cidr, None)?;
         return Ok(true);
@@ -843,7 +1081,7 @@ fn finish_address(
         }
     }
     publish_address(netns, iface, cidr, state, prepared);
-    if state == DadState::Usable {
+    if state == DadState::Usable && observed.joined {
         let _ = iface
             .common()
             .multicast_leave_ref(netns, observed.target().solicited_node().into());
@@ -981,7 +1219,7 @@ pub(crate) fn receive(
         .lock()
         .probes
         .iter()
-        .find(|probe| probe.target() == target && !probe.failed)
+        .find(|probe| probe.target() == target && probe.joined && !probe.failed)
         .copied()
     else {
         return;

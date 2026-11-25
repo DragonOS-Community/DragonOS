@@ -20,6 +20,7 @@ pub mod rbtree;
 pub mod rwlock;
 pub mod rwsem;
 pub mod semaphore;
+pub(crate) mod sha1;
 pub mod spinlock;
 pub mod spinlock_hook;
 pub mod vec_cursor;

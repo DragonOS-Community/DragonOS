@@ -318,6 +318,8 @@ pub struct NetNamespace {
     pub(crate) ipv6_default_prefixes: SpinLock<PrefixSettings>,
     pub(crate) ipv6_all_address_settings: SpinLock<AddressSettings>,
     pub(crate) ipv6_default_address_settings: SpinLock<AddressSettings>,
+    pub(crate) ipv6_idgen_retries: AtomicI32,
+    pub(crate) ipv6_idgen_delay: AtomicI32,
     /// 当前网络命名空间的 loopback 网卡。
     loopback_iface: RcuOptionArcSlot<LoopbackInterface>,
     /// 当前网络命名空间的默认网卡。
@@ -1464,6 +1466,8 @@ impl NetNamespace {
             ipv6_default_prefixes: SpinLock::new(PrefixSettings::default()),
             ipv6_all_address_settings: SpinLock::new(AddressSettings::all_defaults()),
             ipv6_default_address_settings: SpinLock::new(AddressSettings::default()),
+            ipv6_idgen_retries: AtomicI32::new(3),
+            ipv6_idgen_delay: AtomicI32::new(1),
             loopback_iface: RcuOptionArcSlot::new_none(),
             default_iface: RcuOptionArcSlot::new_none(),
         });
@@ -1533,6 +1537,8 @@ impl NetNamespace {
             ipv6_default_prefixes: SpinLock::new(PrefixSettings::default()),
             ipv6_all_address_settings: SpinLock::new(AddressSettings::all_defaults()),
             ipv6_default_address_settings: SpinLock::new(AddressSettings::default()),
+            ipv6_idgen_retries: AtomicI32::new(3),
+            ipv6_idgen_delay: AtomicI32::new(1),
             loopback_iface: RcuOptionArcSlot::new_some(loopback.clone()),
             default_iface: RcuOptionArcSlot::new_none(),
         });

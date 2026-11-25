@@ -22,7 +22,9 @@ pub(crate) fn apply(
     received_at_us: i64,
 ) -> Result<bool, SystemError> {
     let now_us = Instant::now().total_micros();
-    let Some(target) = ipv6_autoconf::address_from_mac(iface.as_ref(), prefix.prefix) else {
+    let Some((target, stable_dad_count)) =
+        ipv6_autoconf::slaac_candidate(netns, iface.as_ref(), prefix.prefix)
+    else {
         return Ok(false);
     };
     let offered = ipv6_lifetime::Lifetimes::from_seconds(
@@ -67,7 +69,15 @@ pub(crate) fn apply(
     }
     if !offered.expired(now_us) {
         let address = Ipv6Cidr::new(target, 64);
-        ipv6_autoconf::start_address_dad(netns, iface, address, Some(offered), now_us)?;
+        ipv6_autoconf::start_address_dad(
+            netns,
+            iface,
+            address,
+            Some(offered),
+            stable_dad_count,
+            now_us,
+            None,
+        )?;
         ipv6_autoconf::changed(iface.common());
     }
     Ok(true)

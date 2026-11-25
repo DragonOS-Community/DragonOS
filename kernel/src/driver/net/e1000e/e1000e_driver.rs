@@ -514,6 +514,10 @@ impl Iface for E1000EInterface {
         return smoltcp::wire::EthernetAddress::from_bytes(&mac);
     }
 
+    fn permanent_mac(&self) -> [u8; 6] {
+        self.mac().0
+    }
+
     #[inline]
     fn iface_name(&self) -> String {
         return self.common.name();

@@ -61,6 +61,11 @@ impl Lifetimes {
         }
     }
 
+    pub(super) fn restart_for_dad(self, now_us: i64) -> Self {
+        let [preferred, valid, ..] = self.cache_info(self.updated_at_us);
+        Self::from_seconds(now_us, valid, preferred)
+    }
+
     pub(super) fn refresh_from_ra(mut self, existing: Option<Self>) -> Self {
         let floor = self.updated_at_us.saturating_add(MIN_VALID_LIFETIME_US);
         let old_deadline = existing.and_then(|lifetimes| lifetimes.valid_until_us);

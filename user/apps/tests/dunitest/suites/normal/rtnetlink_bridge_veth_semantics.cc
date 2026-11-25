@@ -2034,11 +2034,37 @@ TEST(RtnetlinkBridgeVethSemantics, PeerNamespaceDependsOnPeerAttribute) {
 
 TEST(RtnetlinkBridgeVethSemantics, NamespaceExitNotifiesHostPeerDeletion) {
     RouteFd route;
-    RouteFd monitor(RTMGRP_LINK);
     ASSERT_GE(route.fd, 0);
-    ASSERT_GE(monitor.fd, 0);
     const std::string host_name = UniqueName("nh");
     const std::string peer_name = UniqueName("np");
+    const std::string bridge_name = UniqueName("nb");
+    CleanupLinks cleanup {route.fd, bridge_name, host_name};
+    LinkRequest create_bridge(RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, 4447);
+    ASSERT_TRUE(create_bridge.name(bridge_name));
+    AddKind(create_bridge, "bridge");
+    const int bridge_result = SendAck(route.fd, create_bridge);
+    if (bridge_result == EPERM) GTEST_SKIP() << "CAP_NET_ADMIN unavailable";
+    ASSERT_EQ(bridge_result, 0);
+    const uint32_t bridge_index = if_nametoindex(bridge_name.c_str());
+    ASSERT_NE(bridge_index, 0u);
+
+    const auto read_setting = [](const char* path) {
+        const int fd = open(path, O_RDONLY);
+        if (fd < 0) return -1;
+        char value = 0;
+        const ssize_t count = read(fd, &value, 1);
+        close(fd);
+        return count == 1 ? static_cast<int>(value) : -1;
+    };
+    const int default_ra = read_setting("/proc/sys/net/ipv6/conf/default/accept_ra");
+    ASSERT_GE(default_ra, 0);
+    const std::string accept_ra = "/proc/sys/net/ipv6/conf/" + bridge_name + "/accept_ra";
+    const int setting = open(accept_ra.c_str(), O_WRONLY);
+    ASSERT_GE(setting, 0);
+    const char override_ra[] = {default_ra == '2' ? '0' : '2', '\n'};
+    const ssize_t written = write(setting, override_ra, sizeof(override_ra));
+    close(setting);
+    ASSERT_EQ(written, static_cast<ssize_t>(sizeof(override_ra)));
 
     int ready_pipe[2], exit_pipe[2];
     ASSERT_EQ(pipe(ready_pipe), 0);
@@ -2087,13 +2113,41 @@ TEST(RtnetlinkBridgeVethSemantics, NamespaceExitNotifiesHostPeerDeletion) {
         FAIL() << "cross-netns veth create failed: " << create_result;
     }
     const auto host = QueryLink(route.fd, host_name, 4451);
-    ASSERT_TRUE(host.has_value());
+    EXPECT_TRUE(host.has_value());
+    const int old_config = open(accept_ra.c_str(), O_RDONLY);
+    EXPECT_GE(old_config, 0);
+    if (host) {
+        EXPECT_EQ(SetLinkMtu(route.fd, host->index, 1279, 4452), 0);
+        EXPECT_EQ(SetLinkMaster(route.fd, host->index, bridge_index, 4453), 0);
+    }
+    const auto low_bridge = QueryLink(route.fd, bridge_name, 4454);
+    EXPECT_TRUE(low_bridge && low_bridge->mtu == 1279);
+    EXPECT_EQ(access(accept_ra.c_str(), F_OK), -1);
+    EXPECT_EQ(errno, ENOENT);
+    RouteFd monitor(RTMGRP_LINK);
+    EXPECT_GE(monitor.fd, 0);
     const char exit_command = 'X';
     ASSERT_EQ(write(exit_pipe[1], &exit_command, 1), 1);
     close(exit_pipe[1]);
     int status = 0;
     ASSERT_EQ(waitpid(child, &status, 0), child);
-    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_TRUE(WIFEXITED(status));
+    for (int attempt = 0; attempt < 100 && if_nametoindex(host_name.c_str()) != 0; ++attempt) {
+        usleep(10000);
+    }
+    const auto recovered = QueryLink(route.fd, bridge_name, 4455);
+    EXPECT_TRUE(recovered && recovered->mtu == 1500);
+    EXPECT_EQ(read_setting(accept_ra.c_str()), default_ra);
+    if (old_config >= 0) {
+        char value = 0;
+        const ssize_t count = pread(old_config, &value, 1, 0);
+        const int error = errno;
+        close(old_config);
+        EXPECT_EQ(count, -1);
+        EXPECT_EQ(error, ENOENT);
+    }
+    ASSERT_TRUE(host.has_value());
+    ASSERT_GE(monitor.fd, 0);
 
     bool got_delete = false;
     for (int attempt = 0; attempt < 8 && !got_delete; ++attempt) {

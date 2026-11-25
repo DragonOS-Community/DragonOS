@@ -52,7 +52,9 @@ pub(crate) fn add(
     {
         return Err(SystemError::ENODEV);
     }
-    if matches!(update.destination, IpAddress::Ipv6(_)) && !iface.common().ipv6_enabled() {
+    if matches!(update.destination, IpAddress::Ipv6(_))
+        && (!iface.common().ipv6_device_present() || !iface.common().ipv6_enabled())
+    {
         return Err(SystemError::EINVAL);
     }
     validate_iface_and_update(iface, update)?;

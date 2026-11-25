@@ -120,6 +120,7 @@ pub struct IfaceCommon {
     pub(super) iface_id: usize,
     pub(super) name: RwLock<String>,
     name_generation: AtomicU64,
+    ipv6_device_generation: AtomicU64,
     pub(super) flags: AtomicU32,
     pub(super) mtu: AtomicUsize,
     /// Linux-visible transmit queue length. The current devices do not have a
@@ -231,18 +232,7 @@ impl PreparedNetnsBinding {
         let socket_set = common.sockets.read().clone();
         let mut sockets = socket_set.lock();
         let mut namespace = common.net_namespace.write();
-        common
-            .ipv6_forwarding
-            .store(self.netns.ipv6_default_forwarding(), Ordering::Release);
-        common
-            .ipv6_accept_ra
-            .store(self.netns.ipv6_default_accept_ra(), Ordering::Release);
-        let prefixes = *self.netns.ipv6_default_prefixes.lock();
-        {
-            let mut autoconf = common.ipv6_autoconf.lock();
-            autoconf.prefixes = prefixes;
-            autoconf.keep_addr_on_down = self.netns.ipv6_default_keep_addr_on_down();
-        }
+        common.inherit_ipv6_defaults(&self.netns);
         common.route_localnet.store(0, Ordering::Release);
         *namespace = Arc::downgrade(&self.netns);
         sockets.set_udp_ingress_handler(Some(self.ingress));
@@ -296,6 +286,7 @@ impl IfaceCommon {
             iface_id,
             name: RwLock::new(name),
             name_generation: AtomicU64::new(0),
+            ipv6_device_generation: AtomicU64::new(0),
             smol_iface: Mutex::new(iface),
             receive_filter: None,
             sockets: RwLock::new(Arc::new(Mutex::new(sockets))),
@@ -2338,6 +2329,38 @@ impl IfaceCommon {
             } else {
                 value == 2
             }
+    }
+
+    pub(crate) fn ipv6_device_present_at(&self, mtu: usize) -> bool {
+        mtu >= crate::net::address::IPV6_MIN_MTU || self.flags().contains(InterfaceFlags::LOOPBACK)
+    }
+
+    pub(crate) fn ipv6_device_present(&self) -> bool {
+        self.ipv6_device_present_at(self.mtu())
+    }
+
+    pub(crate) fn ipv6_device_generation(&self) -> Option<u64> {
+        self.ipv6_device_present()
+            .then(|| self.ipv6_device_generation.load(Ordering::Acquire))
+    }
+
+    fn inherit_ipv6_defaults(&self, netns: &NetNamespace) {
+        self.ipv6_forwarding
+            .store(netns.ipv6_default_forwarding(), Ordering::Release);
+        self.ipv6_accept_ra
+            .store(netns.ipv6_default_accept_ra(), Ordering::Release);
+        let prefixes = *netns.ipv6_default_prefixes.lock();
+        let mut autoconf = self.ipv6_autoconf.lock();
+        autoconf.prefixes = prefixes;
+        autoconf.keep_addr_on_down = netns.ipv6_default_keep_addr_on_down();
+    }
+
+    /// Renew IPv6 configuration before the link transaction exposes a usable MTU.
+    pub(crate) fn restore_ipv6_device(&self, netns: &NetNamespace, noarp: bool) {
+        crate::net::address::ipv6_autoconf::reset_device_state(self, noarp);
+        self.inherit_ipv6_defaults(netns);
+        self.publish_ipv6_disabled(0);
+        self.ipv6_device_generation.fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn ipv6_disabled_value(&self) -> i32 {

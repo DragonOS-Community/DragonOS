@@ -49,6 +49,9 @@ pub(super) fn validate_entry_on_iface(
         return Err(SystemError::EINVAL);
     }
     if ipv6 {
+        if !iface.common().ipv6_device_present() {
+            return Err(SystemError::ENODEV);
+        }
         if !reject && !iface.common().ipv6_enabled() {
             return Err(SystemError::EACCES);
         }

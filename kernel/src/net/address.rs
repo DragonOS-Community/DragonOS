@@ -546,7 +546,11 @@ pub(in crate::net) fn prepare_link_address_change(
     let link_up = is_up && !was_up;
     let link_down = was_up && !is_up;
     let loopback = iface.flags().contains(InterfaceFlags::LOOPBACK);
-    let effective_mtu = mtu.unwrap_or_else(|| iface.mtu());
+    let current_mtu = iface.mtu();
+    let effective_mtu = mtu.unwrap_or(current_mtu);
+    let was_present = iface.common().ipv6_device_present_at(current_mtu);
+    let is_present = iface.common().ipv6_device_present_at(effective_mtu);
+    let ipv6_enabled = (was_present != is_present).then_some(is_present);
     let restore_ipv6_addresses = link_up && effective_mtu >= IPV6_MIN_MTU;
     let withdraw_ipv6_routes =
         effective_mtu < IPV6_MIN_MTU && (mtu.is_some() || (loopback && link_up));
@@ -586,6 +590,7 @@ pub(in crate::net) fn prepare_link_address_change(
         })
     };
     if !withdraw_ipv6_routes
+        && ipv6_enabled.is_none()
         && !remove_ipv6_addresses
         && restored.is_none()
         && retained_count == 0
@@ -685,7 +690,7 @@ pub(in crate::net) fn prepare_link_address_change(
         ipv6_prefix_change: None,
         was_up,
         is_up,
-        ipv6_enabled: None,
+        ipv6_enabled,
         withdraw_ipv6_routes,
     };
     let routes = match staged_before {
@@ -1115,13 +1120,15 @@ fn validate_published_address_addition(
     iface: &Arc<dyn Iface>,
     cidr: IpCidr,
 ) -> Result<(), SystemError> {
-    if matches!(cidr, IpCidr::Ipv6(_)) && !iface.common().ipv6_enabled() {
-        return Err(SystemError::EACCES);
+    if matches!(cidr, IpCidr::Ipv6(_)) {
+        if !iface.common().ipv6_device_present() {
+            return Err(SystemError::EINVAL);
+        }
+        if !iface.common().ipv6_enabled() {
+            return Err(SystemError::EACCES);
+        }
     }
-    // Linux destroys the IPv4 in_device once MTU drops below the protocol
-    // minimum. A later address add cannot recreate it until the MTU is valid.
-    // IPv6 differs: Linux permits an explicit add below 1280, so keep this
-    // admission rule IPv4-specific.
+    // Linux destroys the IPv4 in_device below the protocol minimum.
     if matches!(cidr, IpCidr::Ipv4(_)) && iface.mtu() < IPV4_MIN_MTU {
         return Err(SystemError::ENOBUFS);
     }

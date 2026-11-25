@@ -184,7 +184,7 @@ pub(crate) fn prepare_link_state_change<'rtnl>(
                 &iface.common().ip_addrs(),
                 &metadata,
                 true,
-                iface.common().ipv6_enabled(),
+                iface.common().ipv6_device_present() && iface.common().ipv6_enabled(),
             )? {
                 // insert_derived() is the lifecycle authority here: the first
                 // UP publishes every deferred constructor address route,
@@ -290,7 +290,8 @@ impl PreparedAddressRouteCommit {
             ipv6_enabled,
             withdraw_ipv6_routes,
         } = change;
-        let was_ipv6_enabled = iface.common().ipv6_enabled();
+        let was_ipv6_enabled =
+            iface.common().ipv6_device_present() && iface.common().ipv6_enabled();
         let is_ipv6_enabled = ipv6_enabled.unwrap_or(was_ipv6_enabled);
         let ifindex = iface.nic_id() as u32;
         let link_down = was_up && !is_up;
@@ -645,7 +646,7 @@ fn derived_address_entries(
         addresses,
         metadata,
         iface.flags().contains(InterfaceFlags::UP),
-        iface.common().ipv6_enabled(),
+        iface.common().ipv6_device_present() && iface.common().ipv6_enabled(),
     )
 }
 

@@ -909,6 +909,103 @@ int RunManualIpv6Dad() {
     return 3460;
 }
 
+int RunIpv6KeepAddressOnDown() {
+    FdGuard fd;
+    uint32_t lo = 0;
+    uint32_t sequence = 7700;
+    if (const int error = PrepareNamespace(&fd, &lo, &sequence); error != 0) return error;
+
+    auto write_setting = [](const char* path, const char (&value)[3]) {
+        FdGuard setting(open(path, O_WRONLY));
+        return setting.Get() >= 0 && write(setting.Get(), value, 2) == 2;
+    };
+    if (!write_setting("/proc/sys/net/ipv6/conf/default/keep_addr_on_down", "1\n")) return 100;
+    constexpr char name[] = "keep77";
+    constexpr uint8_t mac[] = {0x02, 0, 0, 0, 0x77, 0x01};
+    if (const int error = CreateDadVeth(fd.Get(), name, mac, ++sequence); error != 0)
+        return 200 + error;
+    const auto edge = if_nametoindex(name);
+    const auto peer = if_nametoindex("veth0");
+    if (edge == 0 || peer == 0 || edge == peer ||
+        !write_setting("/proc/sys/net/ipv6/conf/keep77/accept_dad", "1\n") ||
+        SetLinkUp(fd.Get(), peer, ++sequence) != 0 || SetLinkUp(fd.Get(), edge, ++sequence) != 0) {
+        return 300;
+    }
+
+    const auto usable = MakeAddress(AF_INET6, "fd77:2324::1", 64, edge);
+    const auto duplicate_checked = MakeAddress(AF_INET6, "fd77:2324:2::1", 64, edge);
+    const auto finite = MakeAddress(AF_INET6, "fd77:2324::3", 64, edge);
+    const auto link_local = MakeAddress(AF_INET6, "fe80::77", 64, edge);
+    constexpr uint16_t create = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    constexpr ifa_cacheinfo finite_lifetime{20, 30, 0, 0};
+    auto add = [&](const AddressSpec& spec, uint32_t flags, const ifa_cacheinfo* cache = nullptr) {
+        return ChangeAddress(fd.Get(), RTM_NEWADDR, create, spec, true, true, ++sequence, nullptr,
+                             std::nullopt, nullptr, flags, cache);
+    };
+    if (add(usable, IFA_F_NODAD) != 0 || add(duplicate_checked, 0) != 0 ||
+        add(finite, IFA_F_NODAD, &finite_lifetime) != 0 || add(link_local, IFA_F_NODAD) != 0) {
+        return 400;
+    }
+
+    auto dad_completed = [&]() {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+        do {
+            if (BindUdp(duplicate_checked, 0) == 0) return true;
+            usleep(20 * 1000);
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    };
+    if (!dad_completed()) return 500;
+    FdGuard monitor(OpenRouteSocket(RTMGRP_IPV6_IFADDR));
+    if (monitor.Get() < 0 || SetLinkUp(fd.Get(), edge, ++sequence, false) != 0) return 600;
+    if (CountAddress(fd.Get(), usable, ++sequence) != 1 ||
+        CountAddress(fd.Get(), duplicate_checked, ++sequence) != 1 ||
+        CountAddress(fd.Get(), finite, ++sequence) != 0 ||
+        CountAddress(fd.Get(), link_local, ++sequence) != 0) {
+        return 700;
+    }
+    if (BindUdp(usable, 0) != 0 || BindUdp(duplicate_checked, 0) != EADDRNOTAVAIL ||
+        CountAddressNotifications(monitor.Get(), RTM_DELADDR, usable) != 0) {
+        return 800;
+    }
+    if (SetLinkUp(fd.Get(), edge, ++sequence) != 0 || BindUdp(usable, 0) != 0 ||
+        !dad_completed()) {
+        return 900;
+    }
+    // Replacing flags on a pending address does not complete its DAD.
+    const auto pending = MakeAddress(AF_INET6, "fd77:2324:3::1", 64, edge);
+    constexpr uint16_t replace = NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE;
+    FdGuard packets(socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IPV6)));
+    sockaddr_ll peer_link{};
+    peer_link.sll_family = AF_PACKET;
+    peer_link.sll_protocol = htons(ETH_P_IPV6);
+    peer_link.sll_ifindex = static_cast<int>(peer);
+    if (packets.Get() < 0 ||
+        bind(packets.Get(), reinterpret_cast<sockaddr*>(&peer_link), sizeof(peer_link)) != 0 ||
+        !write_setting("/proc/sys/net/ipv6/conf/keep77/dad_transmits", "4\n")) {
+        return 1000;
+    }
+    if (add(pending, 0) != 0 || !WaitForDadSolicitation(packets.Get(), pending.local) ||
+        ChangeAddress(fd.Get(), RTM_NEWADDR, replace, pending, true, true, ++sequence,
+                      nullptr, std::nullopt, nullptr, IFA_F_NODAD) != 0 ||
+        BindUdp(pending, 0) != EADDRNOTAVAIL) {
+        return 1010;
+    }
+    if (SetLinkUp(fd.Get(), edge, ++sequence, false) != 0 ||
+        CountAddress(fd.Get(), pending, ++sequence) != 1 ||
+        BindUdp(pending, 0) != EADDRNOTAVAIL) {
+        return 1020;
+    }
+    if (!write_setting("/proc/sys/net/ipv6/conf/keep77/disable_ipv6", "1\n") ||
+        CountAddress(fd.Get(), usable, ++sequence) != 0 ||
+        CountAddress(fd.Get(), duplicate_checked, ++sequence) != 0 ||
+        CountAddress(fd.Get(), pending, ++sequence) != 0 ||
+        BindUdp(usable, 0) != EADDRNOTAVAIL) {
+        return 1100;
+    }
+    return 0;
+}
+
 int RunFiniteIpv6DadFailure() {
     FdGuard fd;
     uint32_t lo = 0;
@@ -1912,6 +2009,11 @@ void ExpectSuccessfulChild(const ChildOutcome& outcome, const char* timeout_mess
 TEST(RtnetlinkAddressSemantics, ManualIpv6DadHonorsFlagsAndLinkReadiness) {
     ExpectSuccessfulChild(RunWithWatchdog(RunManualIpv6Dad),
                           "manual IPv6 duplicate address detection hung");
+}
+
+TEST(RtnetlinkAddressSemantics, Ipv6KeepAddressOnDownRestoresPermanentAddresses) {
+    ExpectSuccessfulChild(RunWithWatchdog(RunIpv6KeepAddressOnDown),
+                          "IPv6 address retention through administrative down hung");
 }
 
 TEST(RtnetlinkAddressSemantics, FiniteIpv6DadFailureDeletesAddressWithFailureFlags) {

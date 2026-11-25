@@ -266,7 +266,8 @@ fn select_ranked_ipv6_source(
     let now = smoltcp::time::Instant::from_micros(crate::time::Instant::now().total_micros());
     let candidate_on = |iface: &Arc<dyn Iface>| {
         let index = iface.nic_id();
-        let (score, source) = iface.smol_iface().lock().ipv6_source_candidate_at(
+        let (score, source) = crate::net::address::ipv6_send_source_candidate(
+            iface,
             &destination,
             now,
             Some(index == oif as usize),
@@ -360,11 +361,10 @@ pub(crate) fn resolve_ipv6_output_route(
         return Err(SystemError::ENETDOWN);
     }
     if let Some(source) = fixed_source {
-        if !matches!(source, IpAddress::Ipv6(_))
-            || !routes.devices.values().any(|candidate| {
-                crate::net::address::iface_accepts_local_address(candidate, source)
-            })
-        {
+        let IpAddress::Ipv6(address) = source else {
+            return Err(SystemError::EADDRNOTAVAIL);
+        };
+        if ipv6_send_source_owner(routes.devices.values(), address).is_none() {
             return Err(SystemError::EADDRNOTAVAIL);
         }
         if super::is_ipv6_link_local(source)
@@ -374,6 +374,18 @@ pub(crate) fn resolve_ipv6_output_route(
         }
     }
     Ok(route)
+}
+
+fn ipv6_send_source_owner<'a>(
+    mut devices: impl Iterator<Item = &'a Arc<dyn Iface>> + Clone,
+    source: Ipv6Address,
+) -> Option<&'a Arc<dyn Iface>> {
+    devices
+        .clone()
+        .find(|iface| crate::net::address::iface_accepts_local_address(iface, source.into()))
+        .or_else(|| {
+            devices.find(|iface| crate::net::address::iface_retains_ipv6_source(iface, source))
+        })
 }
 
 pub(crate) fn resolve_ipv6_send_route(
@@ -443,10 +455,7 @@ pub(crate) fn resolve_ipv6_socket_route(
             .values()
             .filter(|iface| scoped_oif.is_none_or(|oif| iface.nic_id() == oif as usize))
             .filter_map(|iface| {
-                iface
-                    .smol_iface()
-                    .lock()
-                    .ipv6_source_candidate_at(&destination_v6, now, None)
+                crate::net::address::ipv6_send_source_candidate(iface, &destination_v6, now, None)
             })
             .max_by(|left, right| left.0.cmp(&right.0))
             .ok_or(SystemError::EADDRNOTAVAIL)?;
@@ -457,14 +466,19 @@ pub(crate) fn resolve_ipv6_socket_route(
         // ip6_dst_lookup_tail still attempts automatic source selection
         // after an initial route miss. No candidate takes precedence over
         // that route error; an explicit or available source does not.
-        if source.is_none()
-            && !devices.values().any(|iface| {
-                iface.common().ip_addrs().iter().any(|cidr| {
-                    matches!(cidr.address(), IpAddress::Ipv6(source)
-                            if !source.is_unspecified() && !source.is_multicast())
-                })
-            })
-        {
+        if source.is_some() {
+            return SystemError::ENETUNREACH;
+        }
+        let now = smoltcp::time::Instant::from_micros(crate::time::Instant::now().total_micros());
+        if !devices.values().any(|iface| {
+            crate::net::address::ipv6_send_source_candidate(
+                iface,
+                &destination_v6,
+                now,
+                Some(false),
+            )
+            .is_some()
+        }) {
             SystemError::EADDRNOTAVAIL
         } else {
             SystemError::ENETUNREACH
@@ -488,17 +502,15 @@ pub(crate) fn resolve_ipv6_socket_route(
     let uses_routed_source_selection = uses_ranked_ipv6_sources(selected);
     let scoped_destination = ipv6_destination_is_scoped(destination_v6);
     let (source, selected_owner) = if let Some(source) = source {
-        let local = devices.values().any(|candidate| {
-            crate::net::address::iface_accepts_local_address(candidate, source.into())
-        });
-        if !local
-            || super::is_ipv6_link_local(source.into())
-                && (!uses_routed_source_selection || scoped_destination)
-                && !crate::net::address::iface_accepts_local_address(egress, source.into())
+        let owner =
+            ipv6_send_source_owner(devices.values(), source).ok_or(SystemError::EADDRNOTAVAIL)?;
+        if super::is_ipv6_link_local(source.into())
+            && (!uses_routed_source_selection || scoped_destination)
+            && !crate::net::address::iface_accepts_local_address(egress, source.into())
         {
             return Err(SystemError::EADDRNOTAVAIL);
         }
-        (source, None)
+        (source, Some(owner.clone()))
     } else if uses_routed_source_selection
         && !destination_v6.is_unspecified()
         && matches!(selected.source, RouteSourcePolicy::SelectConfigured)

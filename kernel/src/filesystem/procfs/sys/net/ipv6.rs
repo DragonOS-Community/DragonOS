@@ -179,6 +179,7 @@ impl DirOps for NamespaceConfDirOps {
             "accept_ra" => NamespaceConfField::AcceptRa,
             "accept_ra_pinfo" => NamespaceConfField::Prefix(PrefixSetting::AcceptRaPinfo),
             "autoconf" => NamespaceConfField::Prefix(PrefixSetting::Autoconf),
+            "keep_addr_on_down" => NamespaceConfField::KeepAddrOnDown,
             _ => return Err(SystemError::ENOENT),
         };
         Ok(dir
@@ -207,6 +208,7 @@ impl DirOps for NamespaceConfDirOps {
         let _ = self.lookup_child(dir, "accept_ra");
         let _ = self.lookup_child(dir, "accept_ra_pinfo");
         let _ = self.lookup_child(dir, "autoconf");
+        let _ = self.lookup_child(dir, "keep_addr_on_down");
     }
 }
 
@@ -214,6 +216,7 @@ impl DirOps for NamespaceConfDirOps {
 enum NamespaceConfField {
     Forwarding,
     AcceptRa,
+    KeepAddrOnDown,
     Prefix(PrefixSetting),
 }
 
@@ -273,6 +276,12 @@ impl FileOps for NamespaceConfFileOps {
                 (NamespaceConfField::AcceptRa, NamespaceConfScope::Default) => {
                     netns.set_ipv6_default_accept_ra(&rtnl, value);
                 }
+                (NamespaceConfField::KeepAddrOnDown, NamespaceConfScope::All) => {
+                    netns.set_ipv6_all_keep_addr_on_down(&rtnl, value);
+                }
+                (NamespaceConfField::KeepAddrOnDown, NamespaceConfScope::Default) => {
+                    netns.set_ipv6_default_keep_addr_on_down(&rtnl, value);
+                }
                 (NamespaceConfField::Prefix(setting), NamespaceConfScope::All) => {
                     netns.ipv6_all_prefixes.lock().set(*setting, value);
                 }
@@ -309,6 +318,12 @@ impl FileOps for NamespaceConfFileOps {
             (NamespaceConfField::AcceptRa, NamespaceConfScope::All) => netns.ipv6_all_accept_ra(),
             (NamespaceConfField::AcceptRa, NamespaceConfScope::Default) => {
                 netns.ipv6_default_accept_ra()
+            }
+            (NamespaceConfField::KeepAddrOnDown, NamespaceConfScope::All) => {
+                netns.ipv6_all_keep_addr_on_down()
+            }
+            (NamespaceConfField::KeepAddrOnDown, NamespaceConfScope::Default) => {
+                netns.ipv6_default_keep_addr_on_down()
             }
             (NamespaceConfField::Prefix(setting), NamespaceConfScope::All) => {
                 netns.ipv6_all_prefixes.lock().get(*setting)

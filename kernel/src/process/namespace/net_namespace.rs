@@ -310,6 +310,8 @@ pub struct NetNamespace {
     ipv6_default_forwarding: AtomicI32,
     ipv6_all_accept_ra: AtomicI32,
     ipv6_default_accept_ra: AtomicI32,
+    ipv6_all_keep_addr_on_down: AtomicI32,
+    ipv6_default_keep_addr_on_down: AtomicI32,
     pub(crate) ipv6_all_prefixes: SpinLock<PrefixSettings>,
     pub(crate) ipv6_default_prefixes: SpinLock<PrefixSettings>,
     /// 当前网络命名空间的 loopback 网卡。
@@ -1449,6 +1451,8 @@ impl NetNamespace {
             ipv6_default_forwarding: AtomicI32::new(0),
             ipv6_all_accept_ra: AtomicI32::new(1),
             ipv6_default_accept_ra: AtomicI32::new(1),
+            ipv6_all_keep_addr_on_down: AtomicI32::new(0),
+            ipv6_default_keep_addr_on_down: AtomicI32::new(0),
             ipv6_all_prefixes: SpinLock::new(PrefixSettings::default()),
             ipv6_default_prefixes: SpinLock::new(PrefixSettings::default()),
             loopback_iface: RcuOptionArcSlot::new_none(),
@@ -1513,6 +1517,8 @@ impl NetNamespace {
             ipv6_default_forwarding: AtomicI32::new(0),
             ipv6_all_accept_ra: AtomicI32::new(1),
             ipv6_default_accept_ra: AtomicI32::new(1),
+            ipv6_all_keep_addr_on_down: AtomicI32::new(0),
+            ipv6_default_keep_addr_on_down: AtomicI32::new(0),
             ipv6_all_prefixes: SpinLock::new(PrefixSettings::default()),
             ipv6_default_prefixes: SpinLock::new(PrefixSettings::default()),
             loopback_iface: RcuOptionArcSlot::new_some(loopback.clone()),
@@ -2056,6 +2062,32 @@ impl NetNamespace {
         value: i32,
     ) {
         self.ipv6_default_accept_ra.store(value, Ordering::Release);
+    }
+
+    pub(crate) fn ipv6_all_keep_addr_on_down(&self) -> i32 {
+        self.ipv6_all_keep_addr_on_down.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ipv6_default_keep_addr_on_down(&self) -> i32 {
+        self.ipv6_default_keep_addr_on_down.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_ipv6_all_keep_addr_on_down(
+        &self,
+        _rtnl: &crate::net::rtnl::RtnlGuard,
+        value: i32,
+    ) {
+        self.ipv6_all_keep_addr_on_down
+            .store(value, Ordering::Release);
+    }
+
+    pub(crate) fn set_ipv6_default_keep_addr_on_down(
+        &self,
+        _rtnl: &crate::net::rtnl::RtnlGuard,
+        value: i32,
+    ) {
+        self.ipv6_default_keep_addr_on_down
+            .store(value, Ordering::Release);
     }
 
     pub(crate) fn set_ipv6_default_forwarding(

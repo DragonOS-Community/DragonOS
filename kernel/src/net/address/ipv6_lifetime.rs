@@ -171,8 +171,11 @@ pub(super) fn poll(
             return Some(deadline);
         }
         let cidr = entry.cidr;
-        let notify_deprecation =
-            entry.state.is_usable() || matches!(entry.state, AddressState::ManualDad(_));
+        let notify_deprecation = entry.state.is_usable()
+            || matches!(
+                entry.state,
+                AddressState::ManualDad(_) | AddressState::Retained(_)
+            );
         let lifetimes = entry.lifetimes.as_mut().unwrap();
         let expired = lifetimes.expired(now_us);
         if !expired {

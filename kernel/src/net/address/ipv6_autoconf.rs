@@ -60,6 +60,7 @@ pub(crate) enum Setting {
     AcceptDad,
     DadTransmits,
     RouterSolicitations,
+    KeepAddrOnDown,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +107,7 @@ pub(crate) struct DeviceState {
     mode: i32,
     accept_dad: i32,
     dad_transmits: i32,
+    pub(crate) keep_addr_on_down: i32,
     ready_seen: bool,
     dad_ready: bool,
     retry: Option<i64>,
@@ -120,6 +122,7 @@ impl Default for DeviceState {
             mode: 0,
             accept_dad: 1,
             dad_transmits: 1,
+            keep_addr_on_down: 0,
             ready_seen: false,
             dad_ready: false,
             retry: None,
@@ -136,6 +139,7 @@ impl Setting {
             Self::AcceptDad => state.accept_dad,
             Self::DadTransmits => state.dad_transmits,
             Self::RouterSolicitations => state.solicitation.limit,
+            Self::KeepAddrOnDown => state.keep_addr_on_down,
         }
     }
 
@@ -155,6 +159,10 @@ impl Setting {
             Self::AcceptDad if (-1..=2).contains(&value) => state.accept_dad = value,
             Self::DadTransmits if value >= 0 => state.dad_transmits = value,
             Self::RouterSolicitations if value >= -1 => state.solicitation.limit = value,
+            Self::KeepAddrOnDown => {
+                state.keep_addr_on_down = value;
+                return Ok(());
+            }
             _ => return Err(SystemError::EINVAL),
         }
         drop(state);
@@ -329,6 +337,9 @@ fn poll_device(
         };
     }
 
+    let resume_due = resume_retained_addresses(rtnl, netns, iface, dad_ready, now)
+        .err()
+        .map(|_| now.saturating_add(RETRY_US));
     let skip = iface.flags().contains(InterfaceFlags::NOARP);
     let mut index = 0;
     loop {
@@ -369,6 +380,7 @@ fn poll_device(
     let retry = if carrier { state.retry } else { None };
     retry
         .into_iter()
+        .chain(resume_due)
         .chain(
             state
                 .probes
@@ -377,6 +389,49 @@ fn poll_device(
                 .map(|probe| if probe.conflict { now } else { probe.due }),
         )
         .min()
+}
+
+fn resume_retained_addresses(
+    rtnl: &rtnl::RtnlGuard,
+    netns: &Arc<NetNamespace>,
+    iface: &Arc<dyn Iface>,
+    dad_ready: bool,
+    now: i64,
+) -> Result<(), SystemError> {
+    let transmits = manual_dad_transmits(iface.as_ref());
+    if transmits.is_some() && !dad_ready {
+        return Ok(());
+    }
+    loop {
+        let retained = iface
+            .common()
+            .address_metadata()
+            .lock()
+            .iter()
+            .find_map(|entry| match (entry.cidr, entry.state) {
+                (IpCidr::Ipv6(cidr), AddressState::Retained(state)) => {
+                    Some((cidr, state, entry.lifetimes))
+                }
+                _ => None,
+            });
+        let Some((ipv6, retained_dad, lifetimes)) = retained else {
+            return Ok(());
+        };
+        let cidr = IpCidr::Ipv6(ipv6);
+        let (state, dad) = match transmits {
+            Some(_) => (AddressState::ManualDad(retained_dad), DadState::Tentative),
+            None => (AddressState::Configured, DadState::Usable),
+        };
+        let prepared = super::prepare_automatic_address(netns, iface, cidr, state, lifetimes)?;
+        if lifetimes.is_some_and(|lifetime| lifetime.expired(Instant::now().total_micros())) {
+            ipv6_lifetime::remove(rtnl, netns, iface, cidr, None)?;
+            continue;
+        }
+        if let Some(transmits) = transmits {
+            start_probe(netns, iface.common(), ipv6, transmits, now, true)?;
+        }
+        publish_address(netns, iface, cidr, dad, prepared);
+    }
 }
 
 fn generated_link_local(iface: &dyn Iface) -> Option<Ipv6Address> {

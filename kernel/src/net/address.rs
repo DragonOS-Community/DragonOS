@@ -6,7 +6,7 @@
 
 use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 
-use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address, Ipv6AddressExt};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address, Ipv6AddressExt, Ipv6Cidr};
 use system_error::SystemError;
 
 use crate::{
@@ -71,11 +71,17 @@ fn prepare_address_removal(
     after: &mut Vec<IpCidr>,
     metadata: &mut Vec<AddressMetadata>,
     matches: impl Fn(IpCidr) -> bool,
+    keep_retained: bool,
 ) -> Result<(Vec<AddressInfo>, Vec<IpAddress>), SystemError> {
+    let metadata_matches = |entry: &AddressMetadata| {
+        !entry.state.is_usable()
+            && (!keep_retained || !matches!(entry.state, AddressState::Retained(_)))
+            && matches(entry.cidr)
+    };
     let removal_count = after.iter().filter(|&&cidr| matches(cidr)).count()
         + metadata
             .iter()
-            .filter(|entry| !entry.state.is_usable() && matches(entry.cidr))
+            .filter(|entry| metadata_matches(entry))
             .count();
     if removal_count == 0 {
         return Ok((Vec::new(), Vec::new()));
@@ -109,8 +115,11 @@ fn prepare_address_removal(
     let mut index = 0;
     while index < metadata.len() {
         let entry = &metadata[index];
-        if !entry.state.is_usable() && matches(entry.cidr) {
+        if metadata_matches(entry) {
             let entry = metadata.remove(index);
+            if matches!(entry.state, AddressState::Retained(_)) {
+                deleted_addresses.push(entry.cidr.address());
+            }
             removed.push(removed_address_info(
                 entry.cidr,
                 Some(entry),
@@ -170,10 +179,13 @@ pub(crate) fn set_device_ipv6_disabled(
         &iface.common().address_metadata().lock(),
         usize::from(restored.is_some()),
     )?;
-    let (removed_addresses, deleted_addresses) =
-        prepare_address_removal(iface, &mut after, &mut metadata, |cidr| {
-            !enabled && matches!(cidr, IpCidr::Ipv6(_))
-        })?;
+    let (removed_addresses, deleted_addresses) = prepare_address_removal(
+        iface,
+        &mut after,
+        &mut metadata,
+        |cidr| !enabled && matches!(cidr, IpCidr::Ipv6(_)),
+        false,
+    )?;
     after.extend(restored);
     metadata.extend(restored.map(AddressMetadata::configured));
     let routes = crate::net::route::prepare_address_link_change(
@@ -529,21 +541,31 @@ pub(in crate::net) fn prepare_link_address_change(
     is_up: bool,
     staged_before: Option<&crate::net::route::FibTable>,
 ) -> Result<Option<PreparedLinkAddressChange>, SystemError> {
-    let loopback_up = is_up
-        && !was_up
+    let link_up = is_up && !was_up;
+    let link_down = was_up && !is_up;
+    let loopback_up = link_up
         && iface.common().ipv6_enabled()
         && iface.flags().contains(InterfaceFlags::LOOPBACK);
-    let link_down = was_up && !is_up;
-    if mtu.is_none() && !loopback_up && !link_down {
+    if mtu.is_none() && !link_up && !link_down {
         return Ok(None);
     }
-    let has_ipv6_metadata = link_down
-        && iface
-            .common()
-            .address_metadata()
-            .lock()
-            .iter()
-            .any(|entry| matches!(entry.cidr, IpCidr::Ipv6(_)));
+    let (has_ipv6_metadata, retained_count) = {
+        let metadata = iface.common().address_metadata().lock();
+        (
+            link_down
+                && metadata
+                    .iter()
+                    .any(|entry| matches!(entry.cidr, IpCidr::Ipv6(_))),
+            if link_up {
+                metadata
+                    .iter()
+                    .filter(|entry| matches!(entry.state, AddressState::Retained(_)))
+                    .count()
+            } else {
+                0
+            },
+        )
+    };
     let mirror = iface.router_common().ip_addrs.read();
     let remove_ipv6_addresses = link_down
         && (has_ipv6_metadata || mirror.iter().any(|cidr| matches!(cidr, IpCidr::Ipv6(_))));
@@ -563,35 +585,98 @@ pub(in crate::net) fn prepare_link_address_change(
     if !discard_learned_defaults
         && !remove_ipv6_addresses
         && restored.is_none()
+        && retained_count == 0
         && !mirror.iter().copied().any(mtu_removal)
     {
         return Ok(None);
     }
     let before = try_clone_copy_slice(&mirror, 0)?;
-    let mut after = try_clone_copy_slice(&mirror, usize::from(restored.is_some()))?;
+    let mut after =
+        try_clone_copy_slice(&mirror, usize::from(restored.is_some()) + retained_count)?;
     drop(mirror);
 
     let mut metadata = try_clone_metadata(
         &iface.common().address_metadata().lock(),
         usize::from(restored.is_some()),
     )?;
-    let (removed, deleted_addresses) =
-        prepare_address_removal(iface, &mut after, &mut metadata, |cidr| {
-            mtu_removal(cidr) || (remove_ipv6_addresses && matches!(cidr, IpCidr::Ipv6(_)))
-        })?;
+    let keep_addr_on_down = netns.ipv6_all_keep_addr_on_down();
+    let keep_addresses = remove_ipv6_addresses
+        && iface.common().ipv6_enabled()
+        && mtu.unwrap_or_else(|| iface.mtu()) >= IPV6_MIN_MTU
+        && if keep_addr_on_down != 0 {
+            keep_addr_on_down > 0
+        } else {
+            ipv6_autoconf::Setting::KeepAddrOnDown.read(iface.common()) > 0
+        };
+    if keep_addresses {
+        for entry in &mut metadata {
+            let IpCidr::Ipv6(cidr) = entry.cidr else {
+                continue;
+            };
+            let address = cidr.address();
+            if !entry.ipv6_permanent
+                || address.is_unicast_link_local()
+                || address.is_loopback()
+                || mtu_removal(entry.cidr)
+            {
+                continue;
+            }
+            let state = match entry.state {
+                AddressState::Retained(state)
+                | AddressState::ManualDad(state @ (DadState::Tentative | DadState::DadFailed))
+                | AddressState::AutoLinkLocal(
+                    state @ (DadState::Tentative | DadState::DadFailed),
+                )
+                | AddressState::Slaac(state @ (DadState::Tentative | DadState::DadFailed)) => state,
+                _ if entry.ipv6_nodad => DadState::Usable,
+                _ => DadState::Tentative,
+            };
+            entry.state = AddressState::Retained(state);
+        }
+        after.retain(|cidr| {
+            !metadata.iter().any(|entry| {
+                entry.cidr == *cidr && matches!(entry.state, AddressState::Retained(_))
+            })
+        });
+    }
+    let (removed, deleted_addresses) = prepare_address_removal(
+        iface,
+        &mut after,
+        &mut metadata,
+        |cidr| mtu_removal(cidr) || (remove_ipv6_addresses && matches!(cidr, IpCidr::Ipv6(_))),
+        keep_addresses,
+    )?;
 
     metadata.extend(restored.map(AddressMetadata::configured));
-    let (metadata, mut changed_addresses) = if let Some(new_name) = renamed_to {
+    let (mut metadata, mut changed_addresses) = if let Some(new_name) = renamed_to {
         prepare_renamed_metadata(iface, new_name, metadata)?
     } else {
         (metadata, Vec::new())
     };
+    changed_addresses
+        .try_reserve(usize::from(restored.is_some()) + retained_count)
+        .map_err(|_| SystemError::ENOMEM)?;
     if let Some(cidr) = restored {
         after.push(cidr);
-        changed_addresses
-            .try_reserve(1)
-            .map_err(|_| SystemError::ENOMEM)?;
         changed_addresses.push(cidr);
+    }
+    if link_up {
+        let ethernet = iface.type_() == crate::driver::net::types::InterfaceType::ETHER;
+        let now = crate::time::Instant::now().total_micros();
+        for entry in &mut metadata {
+            let AddressState::Retained(state) = entry.state else {
+                continue;
+            };
+            if (state == DadState::Usable || entry.ipv6_nodad || !ethernet)
+                && !entry
+                    .lifetimes
+                    .is_some_and(|lifetime| lifetime.expired(now))
+            {
+                entry.state = AddressState::Configured;
+                after.push(entry.cidr);
+                changed_addresses.push(entry.cidr);
+            }
+        }
     }
     let change = crate::net::route::AddressLinkChange {
         before: &before,
@@ -814,6 +899,7 @@ fn commit_published(
 
     let mut lifetime_deadline_changed = false;
     let mut manual_probe = None;
+    let mut deleted_retained = false;
     let outcome = match mutation {
         CommitMutation::Plain(AddressMutation::Add(cidr) | AddressMutation::Replace(cidr)) => {
             let existing = existing(cidr);
@@ -886,12 +972,20 @@ fn commit_published(
             {
                 return Err(SystemError::EADDRNOTAVAIL);
             }
-            metadata.retain(|entry| entry.cidr != cidr);
+            metadata.retain(|entry| {
+                if entry.cidr != cidr {
+                    return true;
+                }
+                deleted_retained = matches!(entry.state, AddressState::Retained(_));
+                false
+            });
             AddressMutationOutcome::Deleted(cidr)
         }
     };
     let deleted = match outcome {
-        AddressMutationOutcome::Deleted(cidr) if before.contains(&cidr) => Some(cidr.address()),
+        AddressMutationOutcome::Deleted(cidr) if before.contains(&cidr) || deleted_retained => {
+            Some(cidr.address())
+        }
         _ => None,
     };
     let prepared = crate::net::route::prepare_address_update(
@@ -933,7 +1027,7 @@ fn prepare_automatic_address(
                 AddressState::AutoLinkLocal(_)
             ) | (AddressState::Slaac(_), AddressState::Slaac(_))
                 | (
-                    AddressState::ManualDad(_),
+                    AddressState::ManualDad(_) | AddressState::Retained(_),
                     AddressState::ManualDad(_) | AddressState::Configured
                 )
         ) {
@@ -1160,6 +1254,44 @@ pub(crate) fn iface_has_address(iface: &Arc<dyn Iface>, address: IpAddress) -> b
 pub(crate) fn iface_accepts_local_address(iface: &Arc<dyn Iface>, address: IpAddress) -> bool {
     let addresses = iface.common().ip_addrs();
     iface_accepts_local_address_from(iface, &addresses, address)
+}
+
+fn retained_ipv6_source(entry: &AddressMetadata) -> Option<Ipv6Cidr> {
+    match (entry.cidr, entry.state) {
+        (IpCidr::Ipv6(cidr), AddressState::Retained(DadState::Usable)) => Some(cidr),
+        _ => None,
+    }
+}
+
+/// Retained usable addresses remain available to sockets while the device is down.
+pub(crate) fn iface_retains_ipv6_source(iface: &Arc<dyn Iface>, address: Ipv6Address) -> bool {
+    iface
+        .common()
+        .address_metadata()
+        .lock()
+        .iter()
+        .filter_map(retained_ipv6_source)
+        .any(|cidr| cidr.address() == address)
+}
+
+/// Rank an interface's active and retained usable sources as one candidate set.
+pub(super) fn ipv6_send_source_candidate(
+    iface: &Arc<dyn Iface>,
+    destination: &Ipv6Address,
+    now: smoltcp::time::Instant,
+    on_route_device: Option<bool>,
+) -> Option<(impl Ord, Ipv6Address)> {
+    // Read both views under the address publication lock order.
+    let smol = iface.smol_iface().lock();
+    let metadata = iface.common().address_metadata().lock();
+    let mut retained = metadata.iter().filter_map(|entry| {
+        let cidr = retained_ipv6_source(entry)?;
+        let deprecated = entry
+            .lifetimes
+            .is_some_and(|lifetimes| lifetimes.deprecated(now.total_micros()));
+        Some((cidr, deprecated))
+    });
+    smol.ipv6_source_candidate_at(destination, now, on_route_device, Some(&mut retained))
 }
 
 /// Returns whether `address` is an IPv4 broadcast address on `iface`.

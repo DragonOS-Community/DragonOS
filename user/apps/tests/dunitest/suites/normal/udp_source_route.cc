@@ -318,14 +318,22 @@ TEST(UdpIpv6SourceSelection, OrdinaryRouteKeepsTheChosenSourceAcrossSends) {
                 return SendIpv6AddrRequest(route.Get(), type, type == RTM_NEWADDR ? add : request,
                                            device, text, 64, ++seq, scope);
             };
-            auto exercise = [&](const char* expected_text) {
+            auto exercise = [&](const char* expected_text, bool fixed_source = false) {
                 SCOPED_TRACE(expected_text);
                 in6_addr expected{};
                 ASSERT_EQ(inet_pton(AF_INET6, expected_text, &expected), 1);
                 FdGuard sender(socket(AF_INET6, SOCK_DGRAM, 0));
                 ASSERT_GE(sender.Get(), 0);
-                ASSERT_EQ(setsockopt(sender.Get(), SOL_SOCKET, SO_BINDTODEVICE, egress_name,
-                                     sizeof(egress_name)), 0) << ErrnoString(errno);
+                if (fixed_source) {
+                    sockaddr_in6 local{};
+                    local.sin6_family = AF_INET6;
+                    local.sin6_addr = expected;
+                    ASSERT_EQ(bind(sender.Get(), reinterpret_cast<sockaddr*>(&local),
+                                   sizeof(local)), 0) << ErrnoString(errno);
+                } else {
+                    ASSERT_EQ(setsockopt(sender.Get(), SOL_SOCKET, SO_BINDTODEVICE, egress_name,
+                                         sizeof(egress_name)), 0) << ErrnoString(errno);
+                }
                 ASSERT_EQ(connect(sender.Get(), reinterpret_cast<sockaddr*>(&destination),
                                   sizeof(destination)), 0) << ErrnoString(errno);
                 sockaddr_in6 source{};
@@ -358,8 +366,29 @@ TEST(UdpIpv6SourceSelection, OrdinaryRouteKeepsTheChosenSourceAcrossSends) {
             ASSERT_NO_FATAL_FAILURE(expect_route_source(0, "fd89:1::1"));
             ASSERT_NO_FATAL_FAILURE(expect_route_source(RTM_F_FIB_MATCH, nullptr));
             ASSERT_NO_FATAL_FAILURE(exercise("fd89:1::1"));
-            ASSERT_EQ(address(RTM_DELADDR, "fd89:1::1", lo, RT_SCOPE_UNIVERSE), 0);
+
+            // Keep the only global source while its address-owning device
+            // is down. Both automatic and explicitly bound sends use it.
+            FdGuard keep(open("/proc/sys/net/ipv6/conf/lo/keep_addr_on_down", O_WRONLY));
+            ASSERT_GE(keep.Get(), 0) << ErrnoString(errno);
+            ASSERT_EQ(write(keep.Get(), "1\n", 2), 2);
+            ASSERT_EQ(SetLinkUp(route.Get(), lo, false, ++seq), 0);
+            ASSERT_NO_FATAL_FAILURE(expect_route_source(0, "fd89:1::1"));
+            ASSERT_NO_FATAL_FAILURE(exercise("fd89:1::1"));
+            ASSERT_NO_FATAL_FAILURE(exercise("fd89:1::1", true));
             ASSERT_EQ(address(RTM_DELADDR, "fe80::89", egress, RT_SCOPE_LINK), 0);
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_DELROUTE, request, "fd89:2::", 64,
+                                           egress, RT_SCOPE_UNIVERSE, ++seq), 0);
+            FdGuard no_route(socket(AF_INET6, SOCK_DGRAM, 0));
+            ASSERT_GE(no_route.Get(), 0);
+            ASSERT_EQ(connect(no_route.Get(), reinterpret_cast<sockaddr*>(&destination),
+                              sizeof(destination)), -1);
+            EXPECT_EQ(errno, ENETUNREACH);
+            ASSERT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, add, "fd89:2::", 64,
+                                           egress, RT_SCOPE_UNIVERSE, ++seq), 0);
+            ASSERT_EQ(SetLinkUp(route.Get(), lo, true, ++seq), 0);
+
+            ASSERT_EQ(address(RTM_DELADDR, "fd89:1::1", lo, RT_SCOPE_UNIVERSE), 0);
             ASSERT_EQ(address(RTM_NEWADDR, "fe80::89", lo, RT_SCOPE_LINK), 0);
             ASSERT_NO_FATAL_FAILURE(exercise("fe80::89"));
 

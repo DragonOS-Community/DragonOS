@@ -98,6 +98,8 @@ pub(crate) enum AddressState {
     AutoLinkLocal(DadState),
     Slaac(DadState),
     ManualDad(DadState),
+    /// Configured across an administrative down, with no active IP projection.
+    Retained(DadState),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +112,10 @@ pub(crate) enum DadState {
 impl AddressState {
     pub(crate) fn has_dad_state(self) -> bool {
         !matches!(self, Self::Configured)
+    }
+
+    pub(crate) fn is_bindable(self) -> bool {
+        self.is_usable() || matches!(self, Self::Retained(DadState::Usable))
     }
 
     pub(crate) fn is_usable(self) -> bool {

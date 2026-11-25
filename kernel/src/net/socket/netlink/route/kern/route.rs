@@ -82,6 +82,13 @@ pub(super) fn do_new_route(
         normalize_ip(parsed.gateway)
     };
     let requested_oif = parsed.oif.filter(|oif| *oif != 0);
+    if let Some(oif) = requested_oif.filter(|_| request.body().family == AddressFamily::INet6) {
+        let devices = netns.device_list();
+        let iface = devices.get(&(oif as usize)).ok_or(SystemError::ENODEV)?;
+        if !iface.common().ipv6_device_present() {
+            return Err(SystemError::ENODEV);
+        }
+    }
     let oif = match gateway {
         Some(gateway) => route::resolve_gateway_oif(
             &netns,

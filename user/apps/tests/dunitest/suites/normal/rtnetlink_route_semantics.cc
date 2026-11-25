@@ -618,6 +618,13 @@ TEST(RtnetlinkRouteSemantics, ManualIpv6PrefixLifetimeIsIndependentOfAddressObje
             EXPECT_TRUE(FindIpv6Route(route.Get(), "fd95:3::", 80, peer, ++seq));
             EXPECT_TRUE(FindRoute(route.Get(), ipv4, ++seq));
             EXPECT_TRUE(SawIpv6RouteNotification(listener.Get(), "fd95:1::", 80, RTM_DELROUTE));
+            EXPECT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, add, "fd96:1::",
+                                           80, edge, RT_SCOPE_UNIVERSE, ++seq),
+                      ENODEV);
+            EXPECT_EQ(SendIpv6RouteRequest(route.Get(), RTM_NEWROUTE, add, "fd96:2::",
+                                           80, edge, RT_SCOPE_UNIVERSE, ++seq, nullptr, 0,
+                                           nullptr, std::nullopt, RTN_BLACKHOLE),
+                      ENODEV);
         }();
         _exit(testing::Test::HasFailure() ? 1 : 0);
     }

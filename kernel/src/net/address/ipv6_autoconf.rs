@@ -238,7 +238,16 @@ pub(super) fn cancel_target(common: &IfaceCommon, target: Ipv6Address) {
 /// Release the pending solicited-node membership before changing ownership.
 pub(crate) fn reset_for_netns_move(common: &IfaceCommon) {
     cancel(common);
-    *common.ipv6_autoconf.lock() = DeviceState::default();
+    reset_device_state(common, false);
+}
+
+pub(crate) fn reset_device_state(common: &IfaceCommon, noarp: bool) {
+    let mut state = common.ipv6_autoconf.lock();
+    debug_assert!(state.probes.is_empty());
+    *state = DeviceState {
+        accept_dad: if noarp { -1 } else { 1 },
+        ..DeviceState::default()
+    };
 }
 
 pub(super) fn carrier_ready(iface: &dyn Iface) -> bool {

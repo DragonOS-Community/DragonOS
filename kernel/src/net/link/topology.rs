@@ -345,7 +345,7 @@ pub(crate) fn teardown_detached_netns_device(rtnl: &RtnlGuard, iface: Arc<dyn If
         });
         if let Some(master) = peer_master.as_ref() {
             master
-                .detach_port_for_netns_teardown(peer.clone())
+                .detach_port_for_netns_teardown(rtnl, &owner, peer.clone())
                 .expect("live peer must remain attached to its bridge");
         }
         let peer_iface: Arc<dyn Iface> = peer;

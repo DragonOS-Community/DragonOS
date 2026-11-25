@@ -67,8 +67,8 @@ lazy_static! {
 /// 每次创建新的网络命名空间时，都会增加这个计数器
 pub static mut NETNS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-const PACKET_SOCKET_CLEANUP_RETRY_MIN: Duration = Duration::from_millis(100);
-const PACKET_SOCKET_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(5);
+const TOPOLOGY_CLEANUP_RETRY_MIN: Duration = Duration::from_millis(100);
+const TOPOLOGY_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(5);
 
 type NetnsDeviceMap = BTreeMap<usize, Arc<dyn Iface>>;
 
@@ -284,6 +284,7 @@ pub struct NetNamespace {
     /// Serializes all plain/fanout topology updates and owns group IDs.
     packet_sockets_writer: Mutex<PacketSocketRegistryWriter>,
     packet_sockets_need_cleanup: AtomicBool,
+    bridge_mtu_needs_recovery: AtomicBool,
     ///当前网络命名空间下的桥接设备列表
     bridge_list: RwSem<BTreeMap<String, Arc<BridgeDriver>>>,
     bridge_ipv4_netfilter: AtomicBool,
@@ -1091,7 +1092,7 @@ impl NetnsPoller {
     }
 
     fn polling(&self) {
-        let mut cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
+        let mut cleanup_retry_delay = TOPOLOGY_CLEANUP_RETRY_MIN;
         let mut cleanup_retry_at = None;
         let mut ipv6_route_deadline = None;
         let mut ipv6_autoconf_deadline = None;
@@ -1115,23 +1116,21 @@ impl NetnsPoller {
             let nsid = netns.ns_common.nsid.data();
             let cleanup_now_us = Instant::now().total_micros() as u64;
             if cleanup_retry_at.is_none_or(|deadline| cleanup_now_us >= deadline) {
-                match netns.cleanup_packet_sockets() {
-                    PacketSocketCleanupResult::Complete => {
-                        cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
-                        cleanup_retry_at = None;
-                    }
-                    PacketSocketCleanupResult::Pending => {
-                        cleanup_retry_delay = PACKET_SOCKET_CLEANUP_RETRY_MIN;
-                        cleanup_retry_at = None;
-                    }
-                    PacketSocketCleanupResult::AllocationFailed => {
-                        cleanup_retry_at =
-                            Some(cleanup_now_us.saturating_add(cleanup_retry_delay.total_micros()));
-                        cleanup_retry_delay = Duration::from_micros(core::cmp::min(
-                            cleanup_retry_delay.total_micros().saturating_mul(2),
-                            PACKET_SOCKET_CLEANUP_RETRY_MAX.total_micros(),
-                        ));
-                    }
+                let bridge_recovered = netns.recover_bridge_mtu();
+                if matches!(
+                    netns.cleanup_packet_sockets(),
+                    PacketSocketCleanupResult::AllocationFailed
+                ) || !bridge_recovered
+                {
+                    cleanup_retry_at =
+                        Some(cleanup_now_us.saturating_add(cleanup_retry_delay.total_micros()));
+                    cleanup_retry_delay = Duration::from_micros(core::cmp::min(
+                        cleanup_retry_delay.total_micros().saturating_mul(2),
+                        TOPOLOGY_CLEANUP_RETRY_MAX.total_micros(),
+                    ));
+                } else {
+                    cleanup_retry_delay = TOPOLOGY_CLEANUP_RETRY_MIN;
+                    cleanup_retry_at = None;
                 }
             }
 
@@ -1440,6 +1439,7 @@ impl NetNamespace {
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
+            bridge_mtu_needs_recovery: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
             bridge_ipv4_netfilter: AtomicBool::new(true),
             bridge_ipv6_netfilter: AtomicBool::new(true),
@@ -1506,6 +1506,7 @@ impl NetNamespace {
             packet_sockets: RcuArcSlot::new(Arc::new(PacketSocketRegistrySnapshot::default())),
             packet_sockets_writer: Mutex::new(PacketSocketRegistryWriter::new()),
             packet_sockets_need_cleanup: AtomicBool::new(false),
+            bridge_mtu_needs_recovery: AtomicBool::new(false),
             bridge_list: RwSem::new(BTreeMap::new()),
             bridge_ipv4_netfilter: AtomicBool::new(true),
             bridge_ipv6_netfilter: AtomicBool::new(true),
@@ -1676,6 +1677,45 @@ impl NetNamespace {
         {
             self.poller.notify_cleanup();
         }
+    }
+
+    pub(crate) fn request_bridge_mtu_recovery(&self) {
+        if !self.bridge_mtu_needs_recovery.swap(true, Ordering::AcqRel) {
+            self.poller.notify_cleanup();
+        }
+    }
+
+    fn recover_bridge_mtu(self: &Arc<Self>) -> bool {
+        if !self.bridge_mtu_needs_recovery.swap(false, Ordering::AcqRel) {
+            return true;
+        }
+        let rtnl = crate::net::rtnl::lock();
+        let mut next_index = 0;
+        let mut recovered = true;
+        loop {
+            let next = self
+                .device_list()
+                .range(next_index..)
+                .next()
+                .map(|(&index, iface)| (index, iface.clone()));
+            let Some((index, iface)) = next else { break };
+            next_index = index + 1;
+            let Some(bridge) = crate::net::link::topology::as_bridge(iface) else {
+                continue;
+            };
+            if let Err(error) = bridge.reconcile_auto_mtu_after_teardown(&rtnl, self) {
+                if error == SystemError::ENOMEM {
+                    recovered = false;
+                } else {
+                    log::warn!("netns: bridge MTU recovery failed: {:?}", error);
+                }
+            }
+        }
+        if !recovered {
+            self.bridge_mtu_needs_recovery
+                .store(true, Ordering::Release);
+        }
+        recovered
     }
 
     fn try_unregister_packet_socket(&self, socket: &Weak<PacketSocket>) -> Result<(), SystemError> {

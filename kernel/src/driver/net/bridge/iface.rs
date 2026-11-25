@@ -353,41 +353,63 @@ impl BridgeIface {
             .try_remove_device(device as Arc<dyn BridgeEnableDevice>)
     }
 
-    /// A peer whose own netns has already died must be removed without a
-    /// fallible FIB snapshot. Removing a port cannot lower the bridge MTU
-    /// below an IP minimum except when the last port restores 1500, so its
-    /// existing addresses and routes remain valid.
+    /// Removing a peer cannot depend on allocating a FIB snapshot.
     pub(crate) fn detach_port_for_netns_teardown(
         &self,
+        rtnl: &crate::net::rtnl::RtnlGuard,
+        netns: &Arc<NetNamespace>,
         device: Arc<VethInterface>,
     ) -> Result<(), SystemError> {
         self.driver
             .try_remove_device(device as Arc<dyn BridgeEnableDevice>)?;
-        if !self.driver.mtu_set_by_user() {
-            let candidate = self
-                .driver
-                .inner
-                .lock()
-                .ports
-                .values()
-                .map(|port| port.bridge_enable.mtu())
-                .min()
-                .unwrap_or(BRIDGE_MTU);
-            if candidate != self.mtu() {
-                self.common
-                    .smol_iface
-                    .lock()
-                    .set_ip_mtu(self.stack_mtu(candidate))
-                    .expect("attached port MTU must fit the bridge interface");
-                self.common.set_mtu(candidate);
-                crate::net::address::ipv6_autoconf::link_changed(&self.common, self.operstate());
-                let iface = self
-                    .driver
-                    .local_iface()
-                    .expect("live bridge has a local iface");
-                crate::net::socket::netlink::notify_link_change(&(iface as Arc<dyn Iface>));
+        if let Err(error) = self.reconcile_auto_mtu_after_teardown(rtnl, netns) {
+            if error == SystemError::ENOMEM {
+                netns.request_bridge_mtu_recovery();
+            } else {
+                log::warn!("netns: bridge MTU recovery failed: {:?}", error);
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_auto_mtu_after_teardown(
+        &self,
+        rtnl: &crate::net::rtnl::RtnlGuard,
+        netns: &Arc<NetNamespace>,
+    ) -> Result<(), SystemError> {
+        if self.driver.mtu_set_by_user() {
+            return Ok(());
+        }
+        let candidate = self
+            .driver
+            .inner
+            .lock()
+            .ports
+            .values()
+            .map(|port| port.bridge_enable.mtu())
+            .min()
+            .unwrap_or(BRIDGE_MTU);
+        if candidate == self.mtu() {
+            return Ok(());
+        }
+        if !self.common.ipv6_device_present() && self.common.ipv6_device_present_at(candidate) {
+            if let Some(mtu) = self.prepare_auto_mtu(rtnl, netns, candidate)? {
+                crate::net::socket::netlink::notify_link_commit(netns, mtu.commit());
+            }
+            return Ok(());
+        }
+        self.common
+            .smol_iface
+            .lock()
+            .set_ip_mtu(self.stack_mtu(candidate))
+            .expect("attached port MTU must fit the bridge interface");
+        self.common.set_mtu(candidate);
+        crate::net::address::ipv6_autoconf::link_changed(&self.common, self.operstate());
+        let iface = self
+            .driver
+            .local_iface()
+            .expect("live bridge has a local iface");
+        crate::net::socket::netlink::notify_link_change(&(iface as Arc<dyn Iface>));
         Ok(())
     }
 

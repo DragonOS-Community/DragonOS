@@ -722,7 +722,8 @@ bool WaitForDadSolicitation(int fd, const IpBytes& target) {
     return false;
 }
 
-int CreateDadVeth(int fd, const char* name, const uint8_t (&mac)[6], uint32_t sequence) {
+int CreateDadVeth(int fd, const char* name, const uint8_t (&mac)[6], uint32_t sequence,
+                  std::optional<uint32_t> mtu = std::nullopt) {
     constexpr uint16_t kCreate = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
     auto request = NewRequest<ifinfomsg>(RTM_NEWLINK, kCreate, sequence);
     const struct {
@@ -732,6 +733,7 @@ int CreateDadVeth(int fd, const char* name, const uint8_t (&mac)[6], uint32_t se
     AddAttr(&request, IFLA_IFNAME, name, std::strlen(name) + 1);
     AddAttr(&request, IFLA_ADDRESS, mac, sizeof(mac));
     AddAttr(&request, IFLA_LINKINFO, &link_info, sizeof(link_info));
+    if (mtu) AddAttr(&request, IFLA_MTU, &*mtu, sizeof(*mtu));
     return SendAndReceiveAck(fd, request);
 }
 
@@ -1095,6 +1097,63 @@ int RunIpv6KeepAddressOnDown() {
         BindUdp(usable, 0) != EADDRNOTAVAIL) {
         return 1100;
     }
+    return 0;
+}
+
+int RunIpv6DeviceMtuLifecycle() {
+    FdGuard netlink;
+    uint32_t lo = 0;
+    uint32_t sequence = 9600;
+    if (const int error = PrepareNamespace(&netlink, &lo, &sequence); error != 0) return error;
+
+    const int fd = netlink.Get();
+    constexpr uint8_t mac[] = {0x02, 0, 0, 0x96, 0, 1};
+    if (CreateDadVeth(fd, "mtu96", mac, ++sequence, 1279) != 0) return 100;
+    const auto edge = if_nametoindex("mtu96");
+    const auto peer = if_nametoindex("veth0");
+    constexpr char accept_ra[] = "/proc/sys/net/ipv6/conf/mtu96/accept_ra";
+    constexpr char default_ra[] = "/proc/sys/net/ipv6/conf/default/accept_ra";
+    auto missing = [](const char* path) { return access(path, F_OK) == -1 && errno == ENOENT; };
+    auto reads = [](int fd, char expected) {
+        char value{};
+        return pread(fd, &value, sizeof(value), 0) == 1 && value == expected;
+    };
+    auto stale = [](int fd) {
+        char value{};
+        return pread(fd, &value, sizeof(value), 0) == -1 && errno == ENOENT;
+    };
+    if (edge == 0 || peer == 0 || !missing(accept_ra)) return 200;
+    if (SetLinkUp(fd, peer, ++sequence) != 0 || SetLinkUp(fd, edge, ++sequence) != 0 ||
+        CountIpv6RoutesOnInterface(fd, edge, ++sequence) != 0) return 210;
+
+    const auto address = MakeAddress(AF_INET6, "fd96::1", 64, edge);
+    constexpr uint16_t create = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    auto add_address = [&] {
+        return ChangeAddress(fd, RTM_NEWADDR, create, address, true, true, ++sequence);
+    };
+    if (add_address() != EINVAL) return 220;
+    if (SetLinkMtu(fd, edge, 1280, ++sequence) != 0 ||
+        CountIpv6RoutesOnInterface(fd, edge, ++sequence) <= 0 || add_address() != 0) return 300;
+
+    FdGuard old_ipv6(open(accept_ra, O_RDONLY));
+    FdGuard old_ipv4(open("/proc/sys/net/ipv4/conf/mtu96/route_localnet", O_RDONLY));
+    FdGuard defaults(open(default_ra, O_WRONLY));
+    if (!reads(old_ipv6.Get(), '1') || !reads(old_ipv4.Get(), '0') || defaults.Get() < 0)
+        return 400;
+    if (SetLinkMtu(fd, edge, 1279, ++sequence) != 0 || !missing(accept_ra) ||
+        !stale(old_ipv6.Get()) || !reads(old_ipv4.Get(), '0') ||
+        CountIpv6RoutesOnInterface(fd, edge, ++sequence) != 0 ||
+        CountAddress(fd, address, ++sequence) != 0) return 410;
+
+    if (write(defaults.Get(), "0\n", 2) != 2 ||
+        SetLinkUp(fd, edge, ++sequence, false) != 0 ||
+        SetLinkMtu(fd, edge, 1280, ++sequence) != 0) return 500;
+    FdGuard new_ipv6(open(accept_ra, O_RDONLY));
+    if (!reads(new_ipv6.Get(), '0') || !stale(old_ipv6.Get()) ||
+        !reads(old_ipv4.Get(), '0') ||
+        CountIpv6RoutesOnInterface(fd, edge, ++sequence) != 0) return 510;
+    if (SetLinkUp(fd, edge, ++sequence) != 0 ||
+        CountIpv6RoutesOnInterface(fd, edge, ++sequence) <= 0) return 520;
     return 0;
 }
 
@@ -2111,6 +2170,11 @@ TEST(RtnetlinkAddressSemantics, Ipv6KeepAddressOnDownRestoresPermanentAddresses)
 TEST(RtnetlinkAddressSemantics, Ipv6KeepAddressBelowLoopbackMinimumMtu) {
     ExpectSuccessfulChild(RunWithWatchdog(RunIpv6KeepAddressBelowLoopbackMinimumMtu),
                           "IPv6 loopback address retention on MTU change hung");
+}
+
+TEST(RtnetlinkAddressSemantics, LowMtuRecreatesIpv6DeviceConfiguration) {
+    ExpectSuccessfulChild(RunWithWatchdog(RunIpv6DeviceMtuLifecycle),
+                          "IPv6 configuration did not recover after changing MTU");
 }
 
 TEST(RtnetlinkAddressSemantics, FiniteIpv6DadFailureDeletesAddressWithFailureFlags) {

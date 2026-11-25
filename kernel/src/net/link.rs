@@ -406,6 +406,14 @@ impl<'rtnl> PreparedLinkMutation<'rtnl> {
                 renamed_to,
                 || {
                     if let Some(mtu) = mtu {
+                        let common = iface.common();
+                        if !common.ipv6_device_present() && common.ipv6_device_present_at(mtu) {
+                            let noarp = flags.map_or_else(
+                                || iface.flags().contains(InterfaceFlags::NOARP),
+                                |flags| flags.new_flags().contains(InterfaceFlags::NOARP),
+                            );
+                            common.restore_ipv6_device(&netns, noarp);
+                        }
                         let stack_mtu = iface.stack_mtu(mtu);
                         iface
                             .smol_iface()

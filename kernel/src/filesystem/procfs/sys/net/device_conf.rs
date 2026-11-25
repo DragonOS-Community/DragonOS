@@ -64,16 +64,26 @@ struct DeviceIdentity {
     iface: Weak<dyn Iface>,
     namespace_epoch: u64,
     name_generation: u64,
+    ipv6_device_generation: Option<u64>,
 }
 
 impl DeviceIdentity {
-    fn new(namespace: SysctlNamespace, iface: &Arc<dyn Iface>) -> Self {
-        Self {
+    fn new(
+        namespace: SysctlNamespace,
+        iface: &Arc<dyn Iface>,
+        family: DeviceConfFamily,
+    ) -> Option<Self> {
+        let ipv6_device_generation = match family {
+            DeviceConfFamily::Ipv4 => None,
+            DeviceConfFamily::Ipv6 => Some(iface.common().ipv6_device_generation()?),
+        };
+        Some(Self {
             namespace,
             iface: Arc::downgrade(iface),
             namespace_epoch: iface.common().namespace_epoch(),
             name_generation: iface.common().name_generation(),
-        }
+            ipv6_device_generation,
+        })
     }
 
     fn resolve(&self) -> Result<(Arc<NetNamespace>, Arc<dyn Iface>), SystemError> {
@@ -82,6 +92,9 @@ impl DeviceIdentity {
         if self.namespace_epoch & 1 != 0
             || iface.common().namespace_epoch() != self.namespace_epoch
             || iface.common().name_generation() != self.name_generation
+            || self.ipv6_device_generation.is_some_and(|generation| {
+                iface.common().ipv6_device_generation() != Some(generation)
+            })
             || !iface
                 .net_namespace()
                 .is_some_and(|owner| Arc::ptr_eq(&owner, &netns))
@@ -108,7 +121,11 @@ impl DeviceDirOps {
         let netns = namespace.upgrade()?;
         for iface in netns.device_list().values() {
             let child = iface.common().with_iface_name(|current_name| {
-                (current_name == name).then(|| Self::cache(dir, namespace, family, name, iface))
+                if current_name == name {
+                    Self::cache(dir, namespace, family, name, iface)
+                } else {
+                    None
+                }
             });
             if let Some(child) = child {
                 return Ok(child);
@@ -128,7 +145,7 @@ impl DeviceDirOps {
         for iface in netns.device_list().values() {
             iface.common().with_iface_name(|name| {
                 if !matches!(name, "all" | "default") {
-                    Self::cache(dir, namespace, family, name, iface);
+                    let _ = Self::cache(dir, namespace, family, name, iface);
                 }
             });
         }
@@ -150,16 +167,16 @@ impl DeviceDirOps {
         family: DeviceConfFamily,
         name: &str,
         iface: &Arc<dyn Iface>,
-    ) -> Arc<dyn IndexNode> {
+    ) -> Option<Arc<dyn IndexNode>> {
         let mut children = dir.cached_children().write();
-        let identity = DeviceIdentity::new(namespace.clone(), iface);
+        let identity = DeviceIdentity::new(namespace.clone(), iface, family)?;
         if let Some(child) = children.get(name) {
             if child
                 .as_any_ref()
                 .downcast_ref::<ProcDir<Self>>()
                 .is_some_and(|inode| inode.ops().has_identity(&identity))
             {
-                return child.clone();
+                return Some(child.clone());
             }
         }
         let inode = ProcDirBuilder::new(
@@ -170,13 +187,14 @@ impl DeviceDirOps {
         .build()
         .unwrap();
         children.insert(name.to_string(), inode.clone());
-        inode
+        Some(inode)
     }
 
     fn has_identity(&self, identity: &DeviceIdentity) -> bool {
         Weak::ptr_eq(&self.identity.iface, &identity.iface)
             && self.identity.namespace_epoch == identity.namespace_epoch
             && self.identity.name_generation == identity.name_generation
+            && self.identity.ipv6_device_generation == identity.ipv6_device_generation
     }
 }
 

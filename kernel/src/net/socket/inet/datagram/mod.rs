@@ -1631,6 +1631,127 @@ impl UdpSocket {
         Ok(payload.len())
     }
 
+    fn capture_ipv6_send_snapshot(
+        &self,
+        to: Option<IpEndpoint>,
+        scope_oif: Option<u32>,
+    ) -> Result<Ipv6SendSnapshot, SystemError> {
+        loop {
+            let placement = self.iface_placement.read();
+            let (is_unbound, fixed_address) = match self.inner.read().as_ref() {
+                Some(UdpInner::Unbound(unbound)) => (true, unbound.bound_address()),
+                _ => (false, None),
+            };
+            return Ok(if is_unbound {
+                drop(placement);
+                let destination =
+                    Self::normalize_unspecified_dest(to.ok_or(SystemError::EDESTADDRREQ)?);
+                let Ipv6(destination_addr) = destination.addr else {
+                    return Err(SystemError::EAFNOSUPPORT);
+                };
+                if destination.port == 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                let required_oif = match scope_oif {
+                    Some(index) => Some(index),
+                    None => output_flow::socket_constraints(self, destination.addr)?.0,
+                };
+                let receive_bind = IpListenEndpoint {
+                    addr: fixed_address,
+                    port: 0,
+                };
+                let resolved = crate::net::route::resolve_ipv6_send_route(
+                    &self.netns,
+                    destination.addr,
+                    required_oif,
+                    output_flow::bound_source_constraint(&self.netns, receive_bind),
+                )?;
+                let mut prepared = self.prepare_iface_socket(resolved.source_owner.clone())?;
+                let _placement = self.iface_placement.write();
+                let mut inner = self.inner.write();
+                match inner.as_ref() {
+                    Some(UdpInner::Unbound(_)) => {}
+                    // Another operation published its bind during preparation.
+                    // Reuse that bind and resolve the send from its current state.
+                    Some(UdpInner::Bound(_)) => continue,
+                    None => return Err(SystemError::EBADF),
+                }
+                let Some(UdpInner::Unbound(unbound)) = inner.take() else {
+                    unreachable!();
+                };
+                let bound = match unbound.bind_prepared(
+                    // Implicit port allocation does not pin the source address.
+                    // A later send may select another IPv6 source after routing
+                    // changes, just as an unbound Linux UDP socket does.
+                    IpEndpoint::new(Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED), 0),
+                    self.bind_context(),
+                    false,
+                    &mut prepared,
+                ) {
+                    Ok(bound) => bound,
+                    Err((unbound, error)) => {
+                        *inner = Some(UdpInner::Unbound(unbound));
+                        return Err(error);
+                    }
+                };
+                let owner = bound.inner().iface().clone();
+                let source_port = bound.endpoint().port;
+                *inner = Some(UdpInner::Bound(bound));
+                Ipv6SendSnapshot {
+                    owner,
+                    route: resolved.decision,
+                    source: resolved.source,
+                    destination: destination_addr,
+                    source_port,
+                    destination_port: destination.port,
+                }
+            } else {
+                let (destination, local, connection) = {
+                    let inner = self.inner.read();
+                    let bound = match inner.as_ref() {
+                        Some(UdpInner::Bound(bound)) => bound,
+                        Some(UdpInner::Unbound(_)) => unreachable!(),
+                        None => return Err(SystemError::EBADF),
+                    };
+                    let destination = Self::normalize_unspecified_dest(
+                        to.or_else(|| bound.remote_endpoint().ok())
+                            .ok_or(SystemError::EDESTADDRREQ)?,
+                    );
+                    self.validate_bound_send_dest(bound, destination)?;
+                    (destination, bound.endpoint(), bound.connection())
+                };
+                let Ipv6(destination_addr) = destination.addr else {
+                    return Err(SystemError::EAFNOSUPPORT);
+                };
+                let required_oif = match scope_oif {
+                    Some(index) => Some(index),
+                    None => output_flow::socket_constraints(self, destination.addr)?.0,
+                };
+                let fixed_source = output_flow::bound_source_constraint(&self.netns, local)
+                    .or(connection.and_then(|connection| connection.source));
+                let route_cookie = connection.map_or(0, |connection| {
+                    connection.route_cookie_for(destination.addr, required_oif)
+                });
+                let resolved = crate::net::route::resolve_ipv6_socket_route(
+                    &self.netns,
+                    destination.addr,
+                    required_oif,
+                    fixed_source,
+                    crate::net::route::Ipv6RouteIntent::Send(route_cookie),
+                )?;
+                drop(placement);
+                Ipv6SendSnapshot {
+                    owner: resolved.source_owner,
+                    route: resolved.decision,
+                    source: resolved.source,
+                    destination: destination_addr,
+                    source_port: local.port,
+                    destination_port: destination.port,
+                }
+            });
+        }
+    }
+
     /// Admit native IPv6 unicast using one route/source snapshot. The socket
     /// placement lock protects endpoint/device state until that snapshot is
     /// captured, but is never held while executing nft rules or local input.
@@ -1641,114 +1762,7 @@ impl UdpSocket {
         scope_oif: Option<u32>,
     ) -> Result<usize, SystemError> {
         let packet_len = ipv6_packet::packet_len(payload.len());
-        let placement = self.iface_placement.read();
-        let (is_unbound, fixed_address) = match self.inner.read().as_ref() {
-            Some(UdpInner::Unbound(unbound)) => (true, unbound.bound_address()),
-            _ => (false, None),
-        };
-        let snapshot = if is_unbound {
-            drop(placement);
-            let destination =
-                Self::normalize_unspecified_dest(to.ok_or(SystemError::EDESTADDRREQ)?);
-            let Ipv6(destination_addr) = destination.addr else {
-                return Err(SystemError::EAFNOSUPPORT);
-            };
-            if destination.port == 0 {
-                return Err(SystemError::EINVAL);
-            }
-            let required_oif = match scope_oif {
-                Some(index) => Some(index),
-                None => output_flow::socket_constraints(self, destination.addr)?.0,
-            };
-            let receive_bind = IpListenEndpoint {
-                addr: fixed_address,
-                port: 0,
-            };
-            let resolved = crate::net::route::resolve_ipv6_send_route(
-                &self.netns,
-                destination.addr,
-                required_oif,
-                output_flow::bound_source_constraint(&self.netns, receive_bind),
-            )?;
-            let mut prepared = self.prepare_iface_socket(resolved.source_owner.clone())?;
-            let _placement = self.iface_placement.write();
-            let mut inner = self.inner.write();
-            if !matches!(inner.as_ref(), Some(UdpInner::Unbound(_))) {
-                return Err(SystemError::EBADF);
-            }
-            let Some(UdpInner::Unbound(unbound)) = inner.take() else {
-                unreachable!();
-            };
-            let bound = match unbound.bind_prepared(
-                // Implicit port allocation does not pin the source address.
-                // A later send may select another IPv6 source after routing
-                // changes, just as an unbound Linux UDP socket does.
-                IpEndpoint::new(Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED), 0),
-                self.bind_context(),
-                false,
-                &mut prepared,
-            ) {
-                Ok(bound) => bound,
-                Err((unbound, error)) => {
-                    *inner = Some(UdpInner::Unbound(unbound));
-                    return Err(error);
-                }
-            };
-            let owner = bound.inner().iface().clone();
-            let source_port = bound.endpoint().port;
-            *inner = Some(UdpInner::Bound(bound));
-            Ipv6SendSnapshot {
-                owner,
-                route: resolved.decision,
-                source: resolved.source,
-                destination: destination_addr,
-                source_port,
-                destination_port: destination.port,
-            }
-        } else {
-            let (destination, local, connection) = {
-                let inner = self.inner.read();
-                let bound = match inner.as_ref() {
-                    Some(UdpInner::Bound(bound)) => bound,
-                    Some(UdpInner::Unbound(_)) => unreachable!(),
-                    None => return Err(SystemError::EBADF),
-                };
-                let destination = Self::normalize_unspecified_dest(
-                    to.or_else(|| bound.remote_endpoint().ok())
-                        .ok_or(SystemError::EDESTADDRREQ)?,
-                );
-                self.validate_bound_send_dest(bound, destination)?;
-                (destination, bound.endpoint(), bound.connection())
-            };
-            let Ipv6(destination_addr) = destination.addr else {
-                return Err(SystemError::EAFNOSUPPORT);
-            };
-            let required_oif = match scope_oif {
-                Some(index) => Some(index),
-                None => output_flow::socket_constraints(self, destination.addr)?.0,
-            };
-            let fixed_source = output_flow::bound_source_constraint(&self.netns, local)
-                .or(connection.and_then(|connection| connection.source));
-            let route_cookie = connection.map_or(0, |connection| {
-                connection.route_cookie_for(destination.addr, required_oif)
-            });
-            let resolved = crate::net::route::resolve_ipv6_socket_route(
-                &self.netns,
-                destination.addr,
-                required_oif,
-                fixed_source,
-                crate::net::route::Ipv6RouteIntent::Send(route_cookie),
-            )?;
-            drop(placement);
-            Ipv6SendSnapshot {
-                owner: resolved.source_owner,
-                route: resolved.decision,
-                source: resolved.source,
-                destination: destination_addr,
-                source_port: local.port,
-                destination_port: destination.port,
-            }
-        };
+        let snapshot = self.capture_ipv6_send_snapshot(to, scope_oif)?;
 
         let packet_len = packet_len.map_err(|error| {
             let policy = self.pmtu_policy(IpVersion::Ipv6);

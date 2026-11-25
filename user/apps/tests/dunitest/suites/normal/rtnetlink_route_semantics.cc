@@ -1049,6 +1049,33 @@ TEST(RtnetlinkRouteSemantics, Ipv6MulticastRouteFollowsReadinessAndExplicitConfi
             EXPECT_FALSE(route());
             ASSERT_TRUE(set_mode("0\n"));
             EXPECT_TRUE(wait_for_route(true));
+
+            ASSERT_EQ(SetLinkUp(fd.Get(), edge, false, ++seq), 0);
+            ASSERT_TRUE(set_mode("1\n"));
+            ASSERT_EQ(SetLinkUp(fd.Get(), edge, true, ++seq), 0);
+            EXPECT_FALSE(route());
+            FdGuard links(OpenRouteListener(RTMGRP_LINK));
+            ASSERT_GE(links.Get(), 0);
+            ASSERT_EQ(SetLinkUp(fd.Get(), peer, true, ++seq), 0);
+            // Observe readiness without waiting for the asynchronous route.
+            auto saw_ready = [&] {
+                for (;;) {
+                    alignas(nlmsghdr) char messages[4096]{};
+                    int size = static_cast<int>(recv(links.Get(), messages, sizeof(messages), 0));
+                    if (size <= 0) return false;
+                    for (auto* msg = reinterpret_cast<nlmsghdr*>(messages);
+                         NLMSG_OK(msg, size); msg = NLMSG_NEXT(msg, size)) {
+                        if (msg->nlmsg_type != RTM_NEWLINK ||
+                            msg->nlmsg_len < NLMSG_LENGTH(sizeof(ifinfomsg))) continue;
+                        const auto* link = static_cast<const ifinfomsg*>(NLMSG_DATA(msg));
+                        if (link->ifi_index == static_cast<int>(edge) &&
+                            (link->ifi_flags & IFF_RUNNING) != 0) return true;
+                    }
+                }
+            };
+            ASSERT_TRUE(saw_ready());
+            ASSERT_EQ(SetLinkUp(fd.Get(), peer, false, ++seq), 0);
+            EXPECT_TRUE(wait_for_route(true));
         }();
         _exit(testing::Test::HasFailure() ? 1 : 0);
     }

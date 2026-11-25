@@ -111,7 +111,7 @@ pub(crate) struct DeviceState {
     pub(crate) keep_addr_on_down: i32,
     ready_seen: bool,
     multicast_initialized: bool,
-    dad_ready: bool,
+    link_ready_latched: bool,
     retry: Option<i64>,
     probes: Vec<Probe>,
 }
@@ -127,7 +127,7 @@ impl Default for DeviceState {
             keep_addr_on_down: 0,
             ready_seen: false,
             multicast_initialized: false,
-            dad_ready: false,
+            link_ready_latched: false,
             retry: None,
             probes: Vec::new(),
         }
@@ -200,7 +200,7 @@ pub(crate) fn changed(common: &IfaceCommon) {
 }
 
 /// Publish IPv6 readiness on link events so a brief carrier-up interval
-/// counts even if the DAD worker has not yet polled the device.
+/// is visible to address and route initialization even after carrier drops.
 pub(crate) fn link_changed(common: &IfaceCommon, operstate: Operstate) {
     if matches!(
         operstate,
@@ -211,7 +211,7 @@ pub(crate) fn link_changed(common: &IfaceCommon, operstate: Operstate) {
             && common.ipv6_enabled()
             && common.mtu() >= super::IPV6_MIN_MTU
         {
-            state.dad_ready = true;
+            state.link_ready_latched = true;
         }
     }
     changed(common);
@@ -223,7 +223,7 @@ pub(crate) fn cancel(common: &IfaceCommon) {
         state.retry = None;
         state.ready_seen = false;
         state.multicast_initialized = false;
-        state.dad_ready = false;
+        state.link_ready_latched = false;
         state.solicitation.link_reset();
         core::mem::take(&mut state.probes)
     };
@@ -386,20 +386,24 @@ fn poll_device(
     }
     let carrier = carrier_ready(iface.as_ref());
     let common = iface.common();
-    if carrier {
+    let link_ready = {
+        let mut state = common.ipv6_autoconf.lock();
+        state.link_ready_latched |= carrier;
+        state.link_ready_latched
+    };
+    if link_ready {
         if let Some(route) = initialize_multicast_route(rtnl, netns, iface.as_ref(), now) {
             notify_automatic_ipv6_route(netns, route, false, false);
         }
     }
-    let (start, accept_dad, dad_ready) = {
-        let mut state = common.ipv6_autoconf.lock();
-        state.dad_ready |= carrier;
+    let (start, accept_dad) = {
+        let state = common.ipv6_autoconf.lock();
         let start = carrier
             && state.multicast_initialized
             && state.mode == 0
             && !state.ready_seen
             && state.retry.is_none_or(|due| due <= now);
-        (start, state.accept_dad, state.dad_ready)
+        (start, state.accept_dad)
     };
     if start {
         let result = start_address(netns, iface, now);
@@ -412,7 +416,7 @@ fn poll_device(
         };
     }
 
-    let resume_due = resume_retained_addresses(rtnl, netns, iface, dad_ready, now)
+    let resume_due = resume_retained_addresses(rtnl, netns, iface, link_ready, now)
         .err()
         .map(|_| now.saturating_add(RETRY_US));
     let skip = iface.flags().contains(InterfaceFlags::NOARP);
@@ -420,7 +424,7 @@ fn poll_device(
     loop {
         let probe = common.ipv6_autoconf.lock().probes.get(index).copied();
         let Some(probe) = probe else { break };
-        if !probe.can_progress(carrier, dad_ready, skip) {
+        if !probe.can_progress(carrier, link_ready, skip) {
             index += 1;
             continue;
         }
@@ -452,7 +456,11 @@ fn poll_device(
         index += 1;
     }
     let state = common.ipv6_autoconf.lock();
-    let retry = if carrier { state.retry } else { None };
+    let retry = if carrier || (link_ready && !state.multicast_initialized) {
+        state.retry
+    } else {
+        None
+    };
     retry
         .into_iter()
         .chain(resume_due)
@@ -460,7 +468,7 @@ fn poll_device(
             state
                 .probes
                 .iter()
-                .filter(|probe| probe.can_progress(carrier, dad_ready, skip))
+                .filter(|probe| probe.can_progress(carrier, link_ready, skip))
                 .map(|probe| if probe.conflict { now } else { probe.due }),
         )
         .min()

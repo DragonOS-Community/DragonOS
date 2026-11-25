@@ -266,6 +266,7 @@ pub(crate) struct AddressLinkChange<'a> {
     pub is_up: bool,
     pub ipv6_enabled: Option<bool>,
     pub discard_learned_defaults: bool,
+    pub withdraw_ipv6_routes: bool,
 }
 
 impl PreparedAddressRouteCommit {
@@ -289,6 +290,7 @@ impl PreparedAddressRouteCommit {
             is_up,
             ipv6_enabled,
             discard_learned_defaults,
+            withdraw_ipv6_routes,
         } = change;
         let was_ipv6_enabled = iface.common().ipv6_enabled();
         let is_ipv6_enabled = ipv6_enabled.unwrap_or(was_ipv6_enabled);
@@ -304,7 +306,7 @@ impl PreparedAddressRouteCommit {
         };
         let remove_for_ipv6 = |entry: RouteEntry| {
             entry.oif == ifindex
-                && if disable_ipv6 {
+                && if disable_ipv6 || withdraw_ipv6_routes {
                     !is_ipv4(entry.destination.address())
                 } else {
                     discard_learned_defaults
@@ -413,7 +415,7 @@ impl PreparedAddressRouteCommit {
             }
             None => None,
         };
-        if disable_ipv6 || discard_learned_defaults {
+        if disable_ipv6 || discard_learned_defaults || withdraw_ipv6_routes {
             editor.remove_where(remove_for_ipv6)?;
         }
         let mut affected_oifs = editor.finish()?;
@@ -791,10 +793,13 @@ fn entries_for_address(
                 && !ipv4_prefix_is_zeronet(cidr)
                 && (loopback || is_up)
         }
-        // Finite IPv6 prefix routes have an independent lifetime and are
-        // changed only by the explicit address prefix operation.
+        // Finite prefixes on non-loopback links use independent lifetimes.
+        // Retained loopback addresses have no active prefix until link-up.
         IpCidr::Ipv6(_) => {
-            is_up && (loopback || ipv6_permanent) && !matches!(state, AddressState::Slaac(_))
+            is_up
+                && (loopback || ipv6_permanent)
+                && !matches!(state, AddressState::Slaac(_))
+                && !(loopback && matches!(state, AddressState::Retained(_)))
         }
     };
     if add_connected {

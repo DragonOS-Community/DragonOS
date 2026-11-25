@@ -314,7 +314,7 @@ pub(crate) fn resolve_ipv6_route_query(
     let iface = devices
         .get(&(decision.oif as usize))
         .ok_or(SystemError::ENODEV)?;
-    let preferred = if fib_match || source.is_some() {
+    let preferred = if fib_match {
         None
     } else {
         match decision.source {

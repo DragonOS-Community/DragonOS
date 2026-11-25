@@ -145,35 +145,30 @@ impl<'a> FibEditor<'a> {
         route: RouteEntry,
         replace_permanent: bool,
     ) -> Result<Option<(RouteEntry, RouteEntry)>, SystemError> {
-        if let Some(index) = self.fib.address_prefix_slot(route) {
-            let old = self.fib.entries[index];
-            if replace_permanent || old.expires_at_us().is_some() {
-                return self.replace_address_prefix(index, old, route);
-            }
-            return Ok(None);
-        }
-        if route.expires_at_us().is_some() {
-            let occupied = self
-                .fib
-                .index
-                .prefix_candidates(route)
-                .iter()
-                .any(|&index| {
-                    let current = self.fib.entries[index];
-                    !current.is_ra_managed() && same_on_link_alias(current, route)
-                });
-            if occupied {
-                return Ok(None);
-            }
-            if let Some(index) = self.fib.prefix_route_slot(route) {
+        let deadline = route.expires_at_us();
+        if replace_permanent {
+            if let Some(index) = self.fib.connected_prefix_slot(route, None) {
                 let old = self.fib.entries[index];
-                if old.expires_at_us().is_some() {
-                    return self.replace_address_prefix(index, old, route);
+                if old.priority == route.priority {
+                    return self.replace_address_prefix(
+                        index,
+                        old,
+                        old.with_prefix_deadline(deadline),
+                    );
                 }
+                self.delete_address_prefix(index, old)?;
             }
         }
-        self.insert_derived(route)?;
-        Ok(None)
+        let edit = self.fib.plan_address_prefix_add(route);
+        if !matches!(edit, FibEdit::None) {
+            self.record(route.oif)?;
+            self.fib.reserve_edit(edit)?;
+            self.fib.apply_edit(edit);
+        }
+        Ok(match edit {
+            FibEdit::Replace { old, new, .. } => Some((old, new)),
+            _ => None,
+        })
     }
 
     pub(super) fn remove_permanent_address_prefix(
@@ -181,11 +176,7 @@ impl<'a> FibEditor<'a> {
         route: RouteEntry,
         remaining_deadline: Option<i64>,
     ) -> Result<Option<(RouteEntry, RouteEntry)>, SystemError> {
-        let Some(index) = self
-            .fib
-            .address_prefix_slot(route)
-            .or_else(|| self.fib.address_prefix_alias(route))
-        else {
+        let Some(index) = self.fib.connected_prefix_slot(route, None) else {
             return Ok(None);
         };
         let old = self.fib.entries[index];
@@ -194,14 +185,23 @@ impl<'a> FibEditor<'a> {
                 return self.replace_address_prefix(
                     index,
                     old,
-                    old.with_address_prefix_deadline(Some(deadline)),
+                    old.with_prefix_deadline(Some(deadline)),
                 );
             }
         } else {
-            self.record(old.oif)?;
-            self.fib.apply_edit(FibEdit::Delete { index, route: old });
+            self.delete_address_prefix(index, old)?;
         }
         Ok(None)
+    }
+
+    fn delete_address_prefix(
+        &mut self,
+        index: usize,
+        route: RouteEntry,
+    ) -> Result<(), SystemError> {
+        self.record(route.oif)?;
+        self.fib.apply_edit(FibEdit::Delete { index, route });
+        Ok(())
     }
 
     fn replace_address_prefix(
@@ -418,7 +418,7 @@ impl FibTable {
         let analysis = self.index.analyze_insert(route);
         let pio_slot = self.prefix_route_slot(route);
         let first = pio_slot.or(analysis.first);
-        let exact = analysis.exact.or_else(|| self.address_prefix_alias(route));
+        let exact = analysis.exact.or_else(|| self.ipv6_prefix_alias(route));
         let matching_metric = || {
             self.index
                 .prefix_candidates(route)
@@ -593,15 +593,18 @@ impl FibTable {
             .map_or(FibEdit::None, |index| FibEdit::Delete { index, route })
     }
 
-    fn address_prefix_slot(&self, route: RouteEntry) -> Option<usize> {
+    fn connected_prefix_slot(&self, route: RouteEntry, priority: Option<u32>) -> Option<usize> {
         self.index
             .prefix_candidates(route)
             .iter()
             .copied()
-            .find(|&index| {
+            .filter(|&index| {
                 let current = self.entries[index];
-                current.is_address_prefix() && same_on_link_alias(current, route)
+                same_on_link_prefix(current, route)
+                    && current.learned_default().is_none()
+                    && priority.is_none_or(|priority| current.priority == priority)
             })
+            .min_by_key(|&index| self.index.order_key(index))
     }
 
     fn prefix_route_slot(&self, route: RouteEntry) -> Option<usize> {
@@ -643,8 +646,8 @@ impl FibTable {
                 // A nonzero PIO can refresh the expiration of an existing
                 // finite on-link address route. Withdrawal still only removes
                 // RA-owned routes.
-                if current.is_address_prefix() && current.expires_at_us().is_some() {
-                    let new = current.with_address_prefix_deadline(route.expires_at_us());
+                if current.expires_at_us().is_some() {
+                    let new = current.with_prefix_deadline(route.expires_at_us());
                     if new != current {
                         return FibEdit::Replace {
                             index,
@@ -1147,48 +1150,70 @@ impl FibTable {
         })
     }
 
-    fn insert_derived(&mut self, route: RouteEntry) -> Result<bool, SystemError> {
-        let analysis = self.index.analyze_insert(route);
-        if analysis.exact.is_some() || self.address_prefix_alias(route).is_some() {
-            return Ok(false);
+    fn plan_address_prefix_add(&self, route: RouteEntry) -> FibEdit {
+        let Some(index) = self.connected_prefix_slot(route, Some(route.priority)) else {
+            return self.plan_derived_append(route);
+        };
+        let old = self.entries[index];
+        if old.expires_at_us().is_none() {
+            return FibEdit::None;
         }
-        if let Some(index) = self.prefix_route_slot(route) {
-            let old = self.entries[index];
-            // Linux admits a permanent connected route over an expiring
-            // PIO alias. An already permanent PIO occupies the slot.
-            if old.expires_at_us().is_none() {
+        let deadline = route.expires_at_us();
+        // ADD takes over an expiring PIO. In-place REPLACE only changes its deadline.
+        let new = if old.is_ra_prefix() {
+            old.with_address_prefix_deadline(deadline)
+        } else {
+            old.with_prefix_deadline(deadline)
+        };
+        if new == old {
+            FibEdit::None
+        } else {
+            FibEdit::Replace { index, old, new }
+        }
+    }
+
+    fn plan_derived_append(&self, route: RouteEntry) -> FibEdit {
+        // Linux appends address routes after existing equal-metric aliases.
+        FibEdit::Insert {
+            index: self.entries.len(),
+            route,
+            placement: self.index.append_placement(route),
+        }
+    }
+
+    fn insert_derived(&mut self, route: RouteEntry) -> Result<bool, SystemError> {
+        let edit = if route.is_address_prefix() {
+            self.plan_address_prefix_add(route)
+        } else {
+            let analysis = self.index.analyze_insert(route);
+            if analysis.exact.is_some() || self.ipv6_prefix_alias(route).is_some() {
                 return Ok(false);
             }
-            let edit = FibEdit::Replace {
-                index,
-                old,
-                new: route,
-            };
-            self.reserve_edit(edit)?;
-            self.apply_edit(edit);
-            return Ok(true);
+            if let Some(index) = self.prefix_route_slot(route) {
+                let old = self.entries[index];
+                if old.expires_at_us().is_none() {
+                    return Ok(false);
+                }
+                FibEdit::Replace {
+                    index,
+                    old,
+                    new: route,
+                }
+            } else {
+                self.plan_derived_append(route)
+            }
+        };
+        if matches!(edit, FibEdit::None) {
+            return Ok(false);
         }
-        // Linux installs address-derived routes with NLM_F_APPEND: an
-        // existing equal-metric alias keeps precedence over the new kernel
-        // route.
-        let placement = self.index.append_placement(route);
-        let index = self.entries.len();
-        self.reserve_edit(FibEdit::Insert {
-            index,
-            route,
-            placement,
-        })?;
-        self.apply_edit(FibEdit::Insert {
-            index,
-            route,
-            placement,
-        });
+        self.reserve_edit(edit)?;
+        self.apply_edit(edit);
         Ok(true)
     }
 
-    /// An administrator can submit the same public route as an address
-    /// prefix. Its internal ownership and deadline do not create a new alias.
-    fn address_prefix_alias(&self, route: RouteEntry) -> Option<usize> {
+    /// Address-prefix ownership and its internal deadline do not distinguish
+    /// otherwise identical routes submitted through rtnetlink.
+    fn ipv6_prefix_alias(&self, route: RouteEntry) -> Option<usize> {
         if is_ipv4(route.destination.address()) {
             return None;
         }
@@ -1198,10 +1223,17 @@ impl FibTable {
             .copied()
             .find(|&index| {
                 let current = self.entries[index];
-                let differs_by_origin = (current.is_address_prefix()
+                let internal_prefix = |entry: RouteEntry| {
+                    entry.is_address_prefix()
+                        || matches!(
+                            entry.ipv6_metadata,
+                            Some(super::Ipv6RouteMetadata::StaticPrefixExpires(_))
+                        )
+                };
+                let differs_by_metadata = (internal_prefix(current)
                     && route.ipv6_metadata.is_none())
-                    || (route.is_address_prefix() && current.ipv6_metadata.is_none());
-                differs_by_origin
+                    || (internal_prefix(route) && current.ipv6_metadata.is_none());
+                differs_by_metadata
                     && RouteEntry {
                         ipv6_metadata: route.ipv6_metadata,
                         ..current
@@ -1345,8 +1377,11 @@ fn same_derived_slot(left: RouteEntry, right: RouteEntry) -> bool {
 }
 
 fn same_on_link_alias(left: RouteEntry, right: RouteEntry) -> bool {
+    left.priority == right.priority && same_on_link_prefix(left, right)
+}
+
+fn same_on_link_prefix(left: RouteEntry, right: RouteEntry) -> bool {
     same_derived_slot(left, right)
-        && left.priority == right.priority
         && left.gateway.is_none()
         && right.gateway.is_none()
         && left.source.is_none()

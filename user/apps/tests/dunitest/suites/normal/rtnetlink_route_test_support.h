@@ -631,7 +631,8 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
                                                uint8_t prefix_len, uint32_t oif, uint32_t seq,
                                                uint8_t kind = RTN_UNSPEC,
                                                std::optional<Ipv6SourcePrefix> source_prefix =
-                                                   std::nullopt) {
+                                                   std::nullopt,
+                                               std::optional<uint8_t> protocol = std::nullopt) {
     alignas(nlmsghdr) char req_buf[NLMSG_LENGTH(sizeof(rtmsg))] = {};
     auto* nlh = reinterpret_cast<nlmsghdr*>(req_buf);
     auto* rtm = reinterpret_cast<rtmsg*>(NLMSG_DATA(nlh));
@@ -677,7 +678,8 @@ std::optional<Ipv6RouteMetadata> FindIpv6Route(int fd, const char* destination,
             if (route_msg->rtm_family != AF_INET6 || route_msg->rtm_dst_len != prefix_len) {
                 continue;
             }
-            if (kind != RTN_UNSPEC && route_msg->rtm_type != kind) {
+            if ((kind != RTN_UNSPEC && route_msg->rtm_type != kind) ||
+                (protocol.has_value() && route_msg->rtm_protocol != *protocol)) {
                 continue;
             }
             if (source_prefix.has_value() && route_msg->rtm_src_len != source_prefix->length) {

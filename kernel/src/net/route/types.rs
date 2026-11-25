@@ -66,6 +66,7 @@ pub(crate) enum Ipv6RouteMetadata {
     RaDefault(LearnedDefaultRoute),
     RaOnLinkPrefix { expires_at_us: Option<i64> },
     AddressPrefix { expires_at_us: Option<i64> },
+    StaticPrefixExpires(i64),
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -130,9 +131,26 @@ impl RouteEntry {
         self
     }
 
+    pub(super) fn with_prefix_deadline(mut self, expires_at_us: Option<i64>) -> Self {
+        self.ipv6_metadata = match self.ipv6_metadata {
+            Some(Ipv6RouteMetadata::RaOnLinkPrefix { .. }) => {
+                Some(Ipv6RouteMetadata::RaOnLinkPrefix { expires_at_us })
+            }
+            Some(Ipv6RouteMetadata::AddressPrefix { .. }) => {
+                Some(Ipv6RouteMetadata::AddressPrefix { expires_at_us })
+            }
+            None | Some(Ipv6RouteMetadata::StaticPrefixExpires(_)) => {
+                expires_at_us.map(Ipv6RouteMetadata::StaticPrefixExpires)
+            }
+            metadata @ Some(Ipv6RouteMetadata::RaDefault(_)) => metadata,
+        };
+        self
+    }
+
     pub(crate) fn expires_at_us(self) -> Option<i64> {
         match self.ipv6_metadata {
             Some(Ipv6RouteMetadata::RaDefault(default)) => Some(default.expires_at_us),
+            Some(Ipv6RouteMetadata::StaticPrefixExpires(deadline)) => Some(deadline),
             Some(
                 Ipv6RouteMetadata::RaOnLinkPrefix { expires_at_us }
                 | Ipv6RouteMetadata::AddressPrefix { expires_at_us },

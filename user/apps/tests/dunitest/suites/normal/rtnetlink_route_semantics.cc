@@ -458,14 +458,28 @@ TEST(RtnetlinkRouteSemantics, ManualIpv6PrefixLifetimeIsIndependentOfAddressObje
                 return SendIpv6AddrRequest(route.Get(), type, flags, edge, addr, 80, ++seq,
                                            RT_SCOPE_UNIVERSE, lifetime);
             };
-            auto prefix = [&](const char* addr) {
-                return FindIpv6Route(route.Get(), addr, 80, edge, ++seq, RTN_UNICAST);
+            auto prefix = [&](const char* addr, std::optional<uint8_t> protocol = std::nullopt) {
+                return FindIpv6Route(route.Get(), addr, 80, edge, ++seq, RTN_UNICAST,
+                                     std::nullopt, protocol);
             };
 
             ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:1::1", &long_lifetime), 0);
             const auto first = prefix("fd83:1::");
             ASSERT_TRUE(first && first->expires);
             EXPECT_GT(*first->expires, 1000);
+            auto explicit_prefix = [&](uint16_t type, uint16_t flags, const char* addr,
+                                       uint8_t protocol = RTPROT_KERNEL, uint32_t metric = 256) {
+                return SendIpv6RouteRequest(route.Get(), type, flags, addr, 80, edge,
+                                           RT_SCOPE_UNIVERSE, ++seq, nullptr, 0, nullptr,
+                                           std::nullopt, RTN_UNICAST, RT_TABLE_MAIN, protocol, metric);
+            };
+            ASSERT_EQ(explicit_prefix(RTM_NEWROUTE, add, "fd93:5::", RTPROT_STATIC), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd93:5::1"), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, replace, "fd93:5::1", &short_lifetime), 0);
+            const auto static_expiring = prefix("fd93:5::", RTPROT_STATIC);
+            ASSERT_TRUE(static_expiring && static_expiring->expires);
+            EXPECT_GT(*static_expiring->expires, 0);
+
             ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:1::2", &short_lifetime), 0);
             const auto shortened = prefix("fd83:1::");
             ASSERT_TRUE(shortened && shortened->expires);
@@ -495,6 +509,13 @@ TEST(RtnetlinkRouteSemantics, ManualIpv6PrefixLifetimeIsIndependentOfAddressObje
                 usleep(100000);
             }
             ASSERT_TRUE(expired);
+            FdGuard static_sender(socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+            ASSERT_GE(static_sender.Get(), 0);
+            ASSERT_EQ(inet_pton(AF_INET6, "fd93:5::3", &destination.sin6_addr), 1);
+            ASSERT_EQ(connect(static_sender.Get(), reinterpret_cast<sockaddr*>(&destination),
+                              sizeof(destination)), -1);
+            EXPECT_EQ(errno, ENETUNREACH);
+
             FdGuard source(socket(AF_INET6, SOCK_DGRAM, 0));
             ASSERT_GE(source.Get(), 0);
             sockaddr_in6 local{};
@@ -519,12 +540,6 @@ TEST(RtnetlinkRouteSemantics, ManualIpv6PrefixLifetimeIsIndependentOfAddressObje
             ASSERT_TRUE(restored && restored->expires);
             EXPECT_GT(*restored->expires, 1000);
 
-            auto explicit_prefix = [&](uint16_t type, uint16_t flags, const char* addr) {
-                return SendIpv6RouteRequest(route.Get(), type, flags, addr, 80, edge,
-                                           RT_SCOPE_UNIVERSE, ++seq, nullptr, 0, nullptr,
-                                           std::nullopt, RTN_UNICAST, RT_TABLE_MAIN,
-                                           RTPROT_KERNEL, 256);
-            };
             ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:4::1"), 0);
             EXPECT_EQ(explicit_prefix(RTM_NEWROUTE, request | NLM_F_CREATE | NLM_F_APPEND,
                                       "fd83:4::"), EEXIST);
@@ -532,6 +547,41 @@ TEST(RtnetlinkRouteSemantics, ManualIpv6PrefixLifetimeIsIndependentOfAddressObje
             ASSERT_EQ(address(RTM_NEWADDR, add, "fd83:5::1"), 0);
             ASSERT_EQ(address(RTM_DELADDR, request, "fd83:5::1"), 0);
             EXPECT_FALSE(prefix("fd83:5::"));
+
+            ASSERT_EQ(explicit_prefix(RTM_NEWROUTE, add, "fd93:1::", RTPROT_STATIC), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd93:1::1"), 0);
+            EXPECT_TRUE(prefix("fd93:1::", RTPROT_STATIC));
+            EXPECT_FALSE(prefix("fd93:1::", RTPROT_KERNEL));
+            ASSERT_EQ(address(RTM_DELADDR, request, "fd93:1::1"), 0);
+            EXPECT_FALSE(prefix("fd93:1::"));
+
+            ASSERT_EQ(explicit_prefix(RTM_NEWROUTE, add, "fd93:2::", RTPROT_STATIC, 110), 0);
+            ASSERT_EQ(explicit_prefix(RTM_NEWROUTE, add, "fd93:2::", RTPROT_BOOT, 500), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd93:2::1"), 0);
+            ASSERT_EQ(address(RTM_DELADDR, request, "fd93:2::1"), 0);
+            EXPECT_FALSE(prefix("fd93:2::", RTPROT_STATIC));
+            EXPECT_TRUE(prefix("fd93:2::", RTPROT_KERNEL));
+            EXPECT_TRUE(prefix("fd93:2::", RTPROT_BOOT));
+
+            ASSERT_EQ(explicit_prefix(RTM_NEWROUTE, add, "fd93:3::", RTPROT_STATIC, 110), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd93:3::1"), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, replace, "fd93:3::1", &long_lifetime), 0);
+            EXPECT_FALSE(prefix("fd93:3::", RTPROT_STATIC));
+            const auto existing_permanent = prefix("fd93:3::", RTPROT_KERNEL);
+            ASSERT_TRUE(existing_permanent);
+            EXPECT_EQ(existing_permanent->expires.value_or(0), 0);
+
+            ASSERT_EQ(explicit_prefix(RTM_NEWROUTE, add, "fd93:4::", RTPROT_STATIC), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, add, "fd93:4::1"), 0);
+            ASSERT_EQ(address(RTM_NEWADDR, replace, "fd93:4::1", &long_lifetime), 0);
+            const auto static_timed = prefix("fd93:4::", RTPROT_STATIC);
+            ASSERT_TRUE(static_timed && static_timed->expires);
+            EXPECT_GT(*static_timed->expires, 1000);
+            EXPECT_FALSE(prefix("fd93:4::", RTPROT_KERNEL));
+            EXPECT_EQ(explicit_prefix(RTM_NEWROUTE, request | NLM_F_CREATE | NLM_F_APPEND,
+                                      "fd93:4::", RTPROT_STATIC), EEXIST);
+            ASSERT_EQ(explicit_prefix(RTM_DELROUTE, request, "fd93:4::", RTPROT_STATIC), 0);
+            EXPECT_FALSE(prefix("fd93:4::"));
 
             ASSERT_EQ(explicit_prefix(RTM_NEWROUTE, add, "fd95:1::"), 0);
             ASSERT_EQ(address(RTM_NEWADDR, add, "fd95:1::1"), 0);

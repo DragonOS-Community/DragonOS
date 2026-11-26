@@ -7,25 +7,61 @@ use crate::net::socket::inet::InetSocket;
 use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
 use crate::net::socket::recv_timeout::ReceiveTimeout;
 use crate::net::socket::PMSG;
+use crate::net::tcp_stack::TcpStack;
 use crate::syscall::user_buffer::UserBuffer;
 use crate::time::timer::{next_n_us_timer_jiffies, Timer, TimerFunction};
 
-use alloc::sync::Weak;
+use alloc::sync::{Arc, Weak};
 
 use super::constants;
 use super::inner;
 use super::TcpSocket;
 
-/// Existing cork storage plus one logical urgent end; no second payload queue.
+/// Accepted cork bytes waiting for space in the transport send queue.
 #[derive(Debug, Default)]
 pub(crate) struct CorkBuffer {
     bytes: alloc::vec::Vec<u8>,
+    start: usize,
     urgent_end: Option<usize>,
 }
-impl core::ops::Deref for CorkBuffer {
-    type Target = alloc::vec::Vec<u8>;
-    fn deref(&self) -> &Self::Target {
-        &self.bytes
+impl CorkBuffer {
+    fn pending(&self) -> &[u8] {
+        &self.bytes[self.start..]
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending().is_empty()
+    }
+
+    fn append(&mut self, data: &[u8], urgent: bool) {
+        if self.start != 0 {
+            self.bytes.drain(..self.start);
+            self.start = 0;
+        }
+        self.bytes.extend_from_slice(data);
+        if urgent {
+            self.urgent_end = Some(self.bytes.len());
+        }
+    }
+
+    fn consume(&mut self, sent: usize) {
+        self.start += sent;
+        if self.is_empty() {
+            self.bytes.clear();
+            self.start = 0;
+        }
+        self.urgent_end = self
+            .urgent_end
+            .and_then(|end| end.checked_sub(sent))
+            .filter(|end| *end != 0);
+    }
+
+    pub(crate) fn enqueue_into(&mut self, socket: &mut smoltcp::socket::tcp::Socket) {
+        if socket.can_send() {
+            if let Ok(sent) = socket.send_slice_with_urgent(self.pending(), self.urgent_end) {
+                self.consume(sent);
+            }
+        }
     }
 }
 
@@ -194,19 +230,22 @@ impl TcpSocket {
 
     // Called with the empty cork buffer locked. Shutdown and enqueue use the
     // same cork -> inner order, so no data can be published behind this FIN.
-    fn maybe_complete_shutdown_wr_fin(&self) {
+    fn maybe_complete_shutdown_wr_fin(&self) -> Option<Arc<TcpStack>> {
         if !self.is_send_shutdown() {
-            return;
+            return None;
         }
         let mut writer = self.inner.write();
-        if let Some(inner::Inner::Established(established)) = writer.as_mut() {
-            if self
-                .send_fin_deferred
-                .swap(false, core::sync::atomic::Ordering::Relaxed)
-            {
-                established.with_mut(|socket| socket.close());
-            }
+        let Some(inner::Inner::Established(established)) = writer.as_mut() else {
+            return None;
+        };
+        if !self
+            .send_fin_deferred
+            .swap(false, core::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
         }
+        established.with_mut(|socket| socket.close());
+        Some(established.stack().clone())
     }
 
     fn recv_reset_result(
@@ -923,10 +962,10 @@ impl TcpSocket {
             .tcp_cork
             .load(core::sync::atomic::Ordering::Relaxed);
         let mut cork_buf = self.cork_buf.lock();
+        if self.is_send_shutdown() {
+            return Err(SystemError::EPIPE);
+        }
         if !cork_buf.is_empty() || cork_enabled {
-            if self.is_send_shutdown() {
-                return Err(SystemError::EPIPE);
-            }
             let cap = self
                 .send_buf_size()
                 .load(core::sync::atomic::Ordering::Relaxed);
@@ -942,15 +981,12 @@ impl TcpSocket {
                         Err(SystemError::EPIPE)
                     };
                 }
-                let free = cap.saturating_sub(cork_buf.len());
+                let free = cap.saturating_sub(cork_buf.pending().len());
                 if free == 0 {
                     return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
                 }
                 let n = core::cmp::min(free, buf.len());
-                cork_buf.bytes.extend_from_slice(&buf[..n]);
-                if urgent {
-                    cork_buf.urgent_end = Some(cork_buf.bytes.len());
-                }
+                cork_buf.append(&buf[..n], urgent);
                 Ok(n)
             };
             let accepted = match self.inner.read().as_ref() {
@@ -960,7 +996,7 @@ impl TcpSocket {
             }?;
             let flush = urgent
                 || !cork_enabled
-                || cork_buf.len()
+                || cork_buf.pending().len()
                     >= self
                         .tcp_max_seg()
                         .load(core::sync::atomic::Ordering::Relaxed);
@@ -978,81 +1014,63 @@ impl TcpSocket {
             }
             return Ok(accepted);
         }
+        let (accepted, stack) = self.enqueue_direct(buf, urgent.then_some(buf.len()))?;
         drop(cork_buf);
-        self.try_send_direct(buf, urgent.then_some(buf.len()))
-    }
-
-    pub(crate) fn flush_cork_buffer(&self) -> Result<(), SystemError> {
-        if self
-            .cork_flush_in_progress
-            .compare_exchange(
-                false,
-                true,
-                core::sync::atomic::Ordering::Acquire,
-                core::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            return Ok(());
-        }
-        let _guard = CorkFlushGuard(self);
-
-        loop {
-            let cork_buf = self.cork_buf.lock();
-            if cork_buf.is_empty() {
-                self.maybe_complete_shutdown_wr_fin();
-                return Ok(());
-            }
-            let data = cork_buf.bytes.clone();
-            let urgent_end = cork_buf.urgent_end;
-            drop(cork_buf);
-
-            let to_send = data.len();
-            let sent = self.try_send_direct(data.as_slice(), urgent_end)?;
-
-            if sent == 0 {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-
-            let mut cork_buf = self.cork_buf.lock();
-            let consumed = core::cmp::min(sent, to_send);
-            cork_buf.bytes.drain(..consumed);
-            cork_buf.urgent_end = cork_buf
-                .urgent_end
-                .and_then(|end| end.checked_sub(consumed))
-                .filter(|end| *end != 0);
-        }
-    }
-
-    fn try_send_direct(&self, buf: &[u8], urgent_end: Option<usize>) -> Result<usize, SystemError> {
-        let result = {
-            let inner = self.inner.read();
-            match inner.as_ref() {
-                Some(inner::Inner::Established(est)) => Some(
-                    est.send_slice(buf, urgent_end)
-                        .map(|accepted| (accepted, est.stack().clone())),
-                ),
-                _ => None,
-            }
-        };
-
         // Established writes with space can queue data without waiting for a
         // namespace poll. Publish the work after releasing the socket locks.
-        let (accepted, stack) = match result {
-            Some(result) => result?,
-            None => self.try_send_after_connect(buf, urgent_end)?,
-        };
         if accepted != 0 {
             stack.request_poll();
         }
         Ok(accepted)
     }
 
+    pub(crate) fn flush_cork_buffer(&self) -> Result<(), SystemError> {
+        // Serialize the whole enqueue/consume transaction with close, which can
+        // transfer any remaining bytes to the transport's deferred close queue.
+        let mut cork = self.cork_buf.lock();
+        let mut progress = None;
+        let result = loop {
+            if cork.is_empty() {
+                progress = self.maybe_complete_shutdown_wr_fin().or(progress);
+                break Ok(());
+            }
+            match self.enqueue_direct(cork.pending(), cork.urgent_end) {
+                Ok((0, _)) => break Err(SystemError::EAGAIN_OR_EWOULDBLOCK),
+                Ok((sent, stack)) => {
+                    cork.consume(sent);
+                    progress = Some(stack);
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        drop(cork);
+        if let Some(stack) = progress {
+            stack.request_poll();
+        }
+        result
+    }
+
+    fn enqueue_direct(
+        &self,
+        buf: &[u8],
+        urgent_end: Option<usize>,
+    ) -> Result<(usize, Arc<TcpStack>), SystemError> {
+        {
+            let inner = self.inner.read();
+            if let Some(inner::Inner::Established(est)) = inner.as_ref() {
+                return est
+                    .send_slice(buf, urgent_end)
+                    .map(|accepted| (accepted, est.stack().clone()));
+            }
+        }
+        self.try_send_after_connect(buf, urgent_end)
+    }
+
     fn try_send_after_connect(
         &self,
         buf: &[u8],
         urgent_end: Option<usize>,
-    ) -> Result<(usize, alloc::sync::Arc<crate::net::tcp_stack::TcpStack>), SystemError> {
+    ) -> Result<(usize, Arc<TcpStack>), SystemError> {
         let mut writer = self.inner.write();
         if matches!(writer.as_ref(), Some(inner::Inner::Connecting(_))) {
             let Some(inner::Inner::Connecting(conn)) = writer.take() else {
@@ -1088,15 +1106,6 @@ impl TcpSocket {
             Some(_) => Err(SystemError::EPIPE),
             None => Err(SystemError::ENOTCONN),
         }
-    }
-}
-
-struct CorkFlushGuard<'a>(&'a TcpSocket);
-impl Drop for CorkFlushGuard<'_> {
-    fn drop(&mut self) {
-        self.0
-            .cork_flush_in_progress
-            .store(false, core::sync::atomic::Ordering::Release);
     }
 }
 

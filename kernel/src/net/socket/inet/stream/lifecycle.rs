@@ -17,12 +17,6 @@ const TCP_LISTEN_POST_POLL_MAX_ROUNDS: usize = 8192;
 const TCP_LISTEN_POST_POLL_ROUNDS_PER_SOCKET: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CloseObservation {
-    state: smoltcp::socket::tcp::State,
-    unread: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CloseAction {
     kind: DeferredTcpCloseKind,
     reason: DeferredTcpCloseReason,
@@ -154,18 +148,9 @@ impl TcpSocket {
             )
     }
 
-    #[inline]
-    fn observe_established_close(established: &inner::Established) -> CloseObservation {
-        established.with(|socket| CloseObservation {
-            state: socket.state(),
-            unread: socket.recv_queue(),
-        })
-    }
-
-    fn decide_established_close(&self, established: &inner::Established) -> CloseAction {
-        let observation = Self::observe_established_close(established);
-
-        if observation.unread > 0 {
+    fn decide_established_close(&self, socket: &smoltcp::socket::tcp::Socket) -> CloseAction {
+        let state = socket.state();
+        if socket.recv_queue() > 0 {
             return CloseAction {
                 kind: DeferredTcpCloseKind::Reset,
                 reason: DeferredTcpCloseReason::UnreadDataOnClose,
@@ -173,7 +158,7 @@ impl TcpSocket {
             };
         }
 
-        if self.should_abort_established_zero_linger(observation.state) {
+        if self.should_abort_established_zero_linger(state) {
             return CloseAction {
                 kind: DeferredTcpCloseKind::Reset,
                 reason: DeferredTcpCloseReason::ZeroLinger,
@@ -182,7 +167,7 @@ impl TcpSocket {
         }
 
         let abort_on_post_close_data = matches!(
-            observation.state,
+            state,
             smoltcp::socket::tcp::State::Established | smoltcp::socket::tcp::State::SynReceived
         );
 
@@ -221,14 +206,20 @@ impl TcpSocket {
     }
 
     #[inline]
-    fn apply_close_action(socket: &mut smoltcp::socket::tcp::Socket, action: CloseAction) {
+    fn apply_close_action(
+        socket: &mut smoltcp::socket::tcp::Socket,
+        action: CloseAction,
+        defer_fin: bool,
+    ) {
         match action.kind {
             DeferredTcpCloseKind::Reset => socket.abort(),
             DeferredTcpCloseKind::GracefulFin => {
                 if action.abort_on_post_close_data {
                     socket.shutdown_recv();
                 }
-                socket.close();
+                if !defer_fin {
+                    socket.close();
+                }
             }
         }
     }
@@ -801,8 +792,7 @@ impl TcpSocket {
         // Linux/gVisor 语义：TIME_WAIT/Closed 的 stream socket 上 shutdown 应返回 ENOTCONN。
         // 但 Listening 和 Connecting 状态下的 shutdown 是允许的。
         // Serialize pending cork data, FIN and the shutdown bit with send's
-        // enqueue path. A concurrent flusher may have returned early above.
-        // Keep the same cork -> inner order as cork-flush completion.
+        // enqueue path. Keep the same cork -> inner order as close.
         let cork_buf = self.cork_buf.lock();
         let mut writer = self.inner.write();
         let inner = writer.take().expect("Tcp inner::Inner is None");
@@ -819,7 +809,7 @@ impl TcpSocket {
                 }
                 established.confirm_connect();
 
-                if how.contains(ShutdownBit::SHUT_WR) {
+                if how.contains(ShutdownBit::SHUT_WR) && !self.is_send_shutdown() {
                     self.send_fin_deferred
                         .store(!cork_buf.is_empty(), core::sync::atomic::Ordering::Relaxed);
                     if cork_buf.is_empty() {
@@ -951,6 +941,7 @@ impl TcpSocket {
     }
 
     pub fn close_socket(&self) -> Result<(), SystemError> {
+        let mut cork = self.cork_buf.lock();
         let mut writer = self.inner.write();
         if let Some(inner::Inner::Established(socket)) = writer.as_ref() {
             let mut pending = socket.with(|tcp| {
@@ -968,7 +959,9 @@ impl TcpSocket {
                 // socket admits new payload, independent of window updates.
                 for _ in 0..super::poll_util::STACK_POLL_BATCH_ROUNDS {
                     drop(writer);
+                    drop(cork);
                     let _ = stack.poll();
+                    cork = self.cork_buf.lock();
                     writer = self.inner.write();
                     let Some(inner::Inner::Established(socket)) = writer.as_ref() else {
                         break;
@@ -1035,6 +1028,7 @@ impl TcpSocket {
                         kind: DeferredTcpCloseKind::Reset,
                         reason: DeferredTcpCloseReason::ConnectingClose,
                         abort_on_post_close_data: false,
+                        pending_cork: None,
                     });
                     post_poll_rounds =
                         core::cmp::max(post_poll_rounds, TCP_CONNECTING_ABORT_POST_POLL_ROUNDS);
@@ -1051,9 +1045,23 @@ impl TcpSocket {
                 let local_port = es.get_name().port;
                 let iface = es.stack().clone();
                 let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
-                let close_action = self.decide_established_close(&es);
-                es.with_mut(|socket| Self::apply_close_action(socket, close_action));
-                let initial_state = es.with(|socket| socket.state());
+                let (close_action, initial_state, defer_fin) = es.with_mut(|socket| {
+                    let action = self.decide_established_close(socket);
+                    let defer_fin = action.kind == DeferredTcpCloseKind::GracefulFin
+                        && socket.may_send()
+                        && !cork.is_empty();
+                    Self::apply_close_action(socket, action, defer_fin);
+                    (action, socket.state(), defer_fin)
+                });
+                let pending_cork = defer_fin.then_some(core::mem::take(&mut *cork));
+                // The transport may stay writable until the deferred close
+                // queues the tail. No new user writes or SHUT_WR can overtake it.
+                self.send_fin_deferred
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+                self.shutdown.fetch_or(
+                    ShutdownBit::SHUT_WR.bits() as usize,
+                    core::sync::atomic::Ordering::AcqRel,
+                );
                 es.release_port();
                 iface.defer_tcp_close(DeferredTcpCloseRequest {
                     handle,
@@ -1063,6 +1071,7 @@ impl TcpSocket {
                     kind: close_action.kind,
                     reason: close_action.reason,
                     abort_on_post_close_data: close_action.abort_on_post_close_data,
+                    pending_cork,
                 });
                 post_poll_rounds =
                     core::cmp::max(post_poll_rounds, TCP_ESTABLISHED_CLOSE_POST_POLL_ROUNDS);
@@ -1108,6 +1117,7 @@ impl TcpSocket {
             }
         };
         drop(writer);
+        drop(cork);
         if let Some(iface) = post_poll_iface {
             Self::kick_stack_after_tcp_state_change(
                 &iface,

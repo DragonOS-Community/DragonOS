@@ -530,6 +530,67 @@ TEST(TcpCloseSemantics, ShutdownWrThenClosePreservesGracefulClose) {
         << "send after peer graceful close failed: " << ErrnoString(errno);
 }
 
+void ExpectCorkedCloseDeliversAcceptedBytes(bool backpressure) {
+    TcpPair pair;
+    ASSERT_TRUE(InitTcpPair(&pair));
+
+    const int sender = pair.client_fd.Get();
+    const int receiver = pair.server_fd.Get();
+    const int enabled = 1;
+    ASSERT_EQ(0, setsockopt(sender, IPPROTO_TCP, TCP_CORK, &enabled, sizeof(enabled)));
+    const timeval deadline{.tv_sec = 4, .tv_usec = 0};
+    ASSERT_EQ(0, setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)));
+
+    std::vector<char> payload(backpressure ? 256 * 1024 : 24);
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>((i ^ (i >> 8)) & 0xff);
+    }
+    size_t accepted = 0;
+    if (backpressure) {
+        const int capacity = 2304;
+        ASSERT_EQ(0, setsockopt(sender, SOL_SOCKET, SO_SNDBUF, &capacity, sizeof(capacity)));
+        ASSERT_EQ(0, setsockopt(receiver, SOL_SOCKET, SO_RCVBUF, &capacity, sizeof(capacity)));
+        // Fill the send path while the peer leaves its receive window full.
+        while (accepted < payload.size()) {
+            const ssize_t n = send(sender, payload.data() + accepted,
+                                   payload.size() - accepted, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n == -1) {
+                ASSERT_EQ(EAGAIN, errno) << ErrnoString(errno);
+                break;
+            }
+            ASSERT_GT(n, 0);
+            accepted += static_cast<size_t>(n);
+        }
+        ASSERT_GT(accepted, 0u);
+        ASSERT_LT(accepted, payload.size()) << "expected send backpressure before close";
+    } else {
+        ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+                  send(sender, payload.data(), payload.size(), MSG_NOSIGNAL));
+        accepted = payload.size();
+    }
+    ASSERT_EQ(0, close(pair.client_fd.Release()));
+
+    std::vector<char> received(accepted);
+    size_t total = 0;
+    while (total < accepted) {
+        const ssize_t n = read(receiver, received.data() + total, accepted - total);
+        ASSERT_GT(n, 0) << "received " << total << " of " << accepted << " accepted bytes";
+        total += static_cast<size_t>(n);
+    }
+    payload.resize(accepted);
+    EXPECT_EQ(payload, received);
+    char extra;
+    EXPECT_EQ(0, read(receiver, &extra, sizeof(extra))) << ErrnoString(errno);
+}
+
+TEST(TcpCloseSemantics, CloseDeliversCorkedBytesBeforeEof) {
+    ExpectCorkedCloseDeliversAcceptedBytes(false);
+}
+
+TEST(TcpCloseSemantics, CloseDeliversBackpressuredCorkedBytesBeforeEof) {
+    ExpectCorkedCloseDeliversAcceptedBytes(true);
+}
+
 TEST(TcpCloseSemantics, ShutdownWrThenZeroLingerCloseAborts) {
     signal(SIGPIPE, SIG_IGN);
     TcpPair pair;

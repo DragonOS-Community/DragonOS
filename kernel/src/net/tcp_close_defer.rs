@@ -13,7 +13,7 @@ use alloc::sync::Weak;
 use alloc::vec::Vec;
 
 use crate::libs::mutex::Mutex;
-use crate::net::socket::inet::InetSocket;
+use crate::net::socket::inet::{stream::CorkBuffer, InetSocket};
 
 const TCP_ORPHAN_MAX_LIFETIME_SECS: u64 = 60;
 
@@ -46,7 +46,7 @@ pub struct TcpCloseDeferStats {
     pub reset_pending_dropped: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DeferredTcpCloseRequest {
     pub handle: smoltcp::iface::SocketHandle,
     pub local_port: u16,
@@ -55,9 +55,10 @@ pub struct DeferredTcpCloseRequest {
     pub kind: DeferredTcpCloseKind,
     pub reason: DeferredTcpCloseReason,
     pub abort_on_post_close_data: bool,
+    pub(crate) pending_cork: Option<CorkBuffer>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ClosingTcpSocket {
     handle: smoltcp::iface::SocketHandle,
     _local_port: u16,
@@ -74,6 +75,8 @@ struct ClosingTcpSocket {
     _kind: DeferredTcpCloseKind,
     _reason: DeferredTcpCloseReason,
     abort_on_post_close_data: bool,
+    /// Accepted cork bytes that must enter the transport queue before FIN.
+    pending_cork: Option<CorkBuffer>,
 }
 
 /// 延迟回收 TCP sockets：close(fd) 后不立刻从 SocketSet 移除，等状态机 Closed 再回收。
@@ -104,6 +107,7 @@ impl TcpCloseDefer {
             _kind: request.kind,
             _reason: request.reason,
             abort_on_post_close_data: request.abort_on_post_close_data,
+            pending_cork: request.pending_cork,
         });
         drop(guard);
 
@@ -199,6 +203,7 @@ impl TcpCloseDefer {
                     DeferredTcpCloseReason::OrphanTimeout
                 };
                 closing[i].abort_on_post_close_data = false;
+                closing[i].pending_cork = None;
 
                 let mut stats = self.stats.lock();
                 if should_abort_post_close_data {
@@ -208,6 +213,21 @@ impl TcpCloseDefer {
                 }
                 i += 1;
                 continue;
+            }
+
+            if let Some(cork) = closing[i].pending_cork.as_mut() {
+                let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                if socket.may_send() {
+                    // Ingress has processed any ACKs before the close pass.
+                    // poll_at() will schedule newly queued data and FIN.
+                    cork.enqueue_into(socket);
+                    if cork.is_empty() {
+                        socket.close();
+                        closing[i].pending_cork = None;
+                    }
+                } else {
+                    closing[i].pending_cork = None;
+                }
             }
 
             // Linux moves TIME-WAIT into a lightweight inet_timewait_sock.  Keeping

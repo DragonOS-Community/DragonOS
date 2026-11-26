@@ -34,6 +34,7 @@ mod events;
 mod io;
 use crate::net::socket::recv_buffer::{ReceiveAttempt, RecvBuffer};
 use crate::net::socket::recv_timeout::ReceiveTimeout;
+pub(crate) use io::CorkBuffer;
 use io::{TcpPeekCursor, TcpReceiveTarget};
 mod lifecycle;
 mod poll_util;

@@ -251,11 +251,12 @@ impl fmt::Debug for ProcFS {
 
 impl ProcFS {
     pub fn new(pid_ns: Arc<PidNamespace>) -> Arc<Self> {
-        let super_block = SuperBlock::new(
+        let mut super_block = SuperBlock::new(
             Magic::PROC_MAGIC,
             PROCFS_BLOCK_SIZE,
             PROCFS_MAX_NAMELEN as u64,
         );
+        super_block.frsize = PROCFS_BLOCK_SIZE;
 
         let fs: Arc<ProcFS> = Arc::new_cyclic(|weak_fs| ProcFS {
             pid_ns: pid_ns.clone(),

@@ -94,24 +94,28 @@ impl Syscall {
                     arch_info.save_fs_selector();
                     arch_info.save_fsbase();
                 };
+                let fsbase = arch_info.fsbase;
+                drop(arch_info);
                 let mut writer = UserBufferWriter::new(
                     arg2 as *mut usize,
                     core::mem::size_of::<usize>(),
                     from_user,
                 )?;
-                writer.copy_one_to_user(&arch_info.fsbase, 0)?;
+                writer.copy_one_to_user(&fsbase, 0)?;
             }
             ARCH_GET_GS => {
                 unsafe {
                     arch_info.save_gs_selector();
                     arch_info.save_user_gsbase();
                 };
+                let gsbase = arch_info.gsbase;
+                drop(arch_info);
                 let mut writer = UserBufferWriter::new(
                     arg2 as *mut usize,
                     core::mem::size_of::<usize>(),
                     from_user,
                 )?;
-                writer.copy_one_to_user(&arch_info.gsbase, 0)?;
+                writer.copy_one_to_user(&gsbase, 0)?;
             }
             ARCH_SET_FS => {
                 // Only reject kernel addresses; any user address is allowed.

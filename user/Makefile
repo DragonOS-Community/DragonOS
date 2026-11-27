@@ -3,9 +3,7 @@ user_sub_dirs = apps
 ROOT_PATH ?= $(abspath ..)
 DADK ?= dadk
 
-DADK_VERSION=$(shell dadk -V | awk 'END {print $$2}')
-# 最小的DADK版本
-MIN_DADK_VERSION = 0.6.1
+DADK_BIN = $(or $(strip $(DADK)),dadk)
 DADK_CACHE_DIR = $(ROOT_PATH)/bin/dadk_cache
 # 统一使用由 tools/rootfs_manifest_resolve.sh 生成的 manifest
 DADK_MANIFEST_FILE ?= $(ROOT_PATH)/dadk-manifest.generated.toml
@@ -22,29 +20,9 @@ ECHO:
 	@echo "$@"
 
 
+.PHONY: install_dadk
 install_dadk:
-# 如果未安装
-ifeq ("$(DADK_VERSION)", "")
-	@echo "\ndadk is not installed."
-	@echo "Please install dadk $(MIN_DADK_VERSION) or higher version"
-	@echo "\nYou can install dadk by running the following command:"
-	@echo "\n\tcargo install dadk"
-	@echo "\nOr you can install dadk from source by running the following command:"
-	@echo "\n\tcargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION) --locked"
-	@echo "\n"
-	@echo "Auto installing dadk..."
-	cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION) --locked
-else
-# 如果DADK版本过低，则自动更新
-	@echo "dadk version $(DADK_VERSION) installed"
-# 如果DADK版本过低，则自动更新
-ifneq ($(shell printf '%s\n%s' "$(DADK_VERSION)" "$(MIN_DADK_VERSION)" | sort -V | head -n1), $(MIN_DADK_VERSION))
-	@echo "dadk version is too low, please update to $(MIN_DADK_VERSION) or higher version"
-	@echo "Updating dadk..."
-	cargo install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v$(MIN_DADK_VERSION) --locked || (echo "dadk update failed" && exit 1)
-	@echo "dadk updated"
-endif
-endif
+	@bash "$(ROOT_PATH)/tools/install-dadk.sh" "$(DADK_BIN)"
 
 .PHONY: dadk_run
 dadk_run: install_dadk
@@ -71,10 +49,10 @@ dadk_run: install_dadk
 			rm -rf "$(ROOT_PATH)/bin/sysroot"; \
 			mkdir -p "$(ROOT_PATH)/bin/sysroot"; \
 		fi; \
-		$(DADK) -f $(DADK_MANIFEST_FILE) user clean --level output -w $(ROOT_PATH) || true; \
+		"$(DADK_BIN)" -f $(DADK_MANIFEST_FILE) user clean --level output -w $(ROOT_PATH) || true; \
 	fi
-	$(DADK) -f $(DADK_MANIFEST_FILE) user build -w $(ROOT_PATH)
-	$(DADK) -f $(DADK_MANIFEST_FILE) user install -w $(ROOT_PATH)
+	"$(DADK_BIN)" -f $(DADK_MANIFEST_FILE) user build -w $(ROOT_PATH)
+	"$(DADK_BIN)" -f $(DADK_MANIFEST_FILE) user install -w $(ROOT_PATH)
 	@marker_expected="manifest=$(ROOTFS_MANIFEST);layout=$(SYSROOT_LAYOUT_VERSION)"; \
 	if [ -f "$(ROOT_PATH)/config/rootfs.generated.toml" ]; then \
 		rootfs_hash="$$(sha256sum "$(ROOT_PATH)/config/rootfs.generated.toml" | awk '{print $$1}')"; \

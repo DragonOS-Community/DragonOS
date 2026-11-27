@@ -689,8 +689,8 @@ fi
 # 安装rust
 rustInstall
 
-# 安装dadk
-cargo +nightly install --git https://git.mirrors.dragonos.org.cn/DragonOS-Community/DADK.git --tag v0.6.1 --locked || exit 1
+# 安装源码树自带的 DADK。
+bash "$(dirname -- "${BASH_SOURCE[0]}")/install-dadk.sh" || exit 1
 
 bashpath=$(cd `dirname $0`; pwd)
 

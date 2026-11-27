@@ -247,7 +247,6 @@ pub struct TcpSocketData {
     /// SocketSet lock to copy data to userspace.
     pub(crate) recv_lock: Mutex<()>,
     pub(crate) resize_lock: Mutex<()>,
-    pub(crate) cork_flush_in_progress: AtomicBool,
     pub(crate) cork_timer_active: AtomicBool,
     pub(crate) ip_version: smoltcp::wire::IpVersion,
 }
@@ -356,7 +355,6 @@ impl TcpSocket {
             error_queue: Mutex::new(super::super::common::error_queue::ErrorQueue::default()),
             recv_lock: Mutex::new(()),
             resize_lock: Mutex::new(()),
-            cork_flush_in_progress: AtomicBool::new(false),
             cork_timer_active: AtomicBool::new(false),
             ip_version,
         }

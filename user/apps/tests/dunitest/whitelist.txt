@@ -209,6 +209,7 @@ normal/internal_shmem
 normal/fd_table_semantics
 normal/proc_task_status
 normal/proc_stat_sched_fields
+normal/procfs_statfs
 normal/proc_uptime
 normal/slab_memory_accounting
 normal/procfs_task_semantics
@@ -328,4 +329,6 @@ normal/unix_socket_stat
 normal/tty_fionread
 normal/bpf_map_lookup_fault
 normal/cpu_topology_sysfs
+normal/arch_prctl_fault
+normal/sysv_shm_lock_fault
 normal/tty_fasync_concurrency

@@ -1,0 +1,53 @@
+name: DADK
+
+on:
+  push:
+    branches: ["master", "feat-*", "fix-*"]
+    paths:
+      - "tools/dadk/**"
+      - "tools/install-dadk.sh"
+      - "tools/bootstrap.sh"
+      - "tools/Dockerfile"
+      - "tools/.dockerignore"
+      - "user/Makefile"
+      - ".github/workflows/dadk.yml"
+  pull_request:
+    branches: ["master", "feat-*", "fix-*"]
+    paths:
+      - "tools/dadk/**"
+      - "tools/install-dadk.sh"
+      - "tools/bootstrap.sh"
+      - "tools/Dockerfile"
+      - "tools/.dockerignore"
+      - "user/Makefile"
+      - ".github/workflows/dadk.yml"
+
+jobs:
+  build-test:
+    name: Build, test, and format
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/dadk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native TLS build dependencies
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - name: Install the vendored CLI
+        run: |
+          export CARGO_INSTALL_ROOT="$RUNNER_TEMP/dadk-install"
+          export CARGO_TARGET_DIR="$PWD/target"
+          export PATH="$CARGO_INSTALL_ROOT/bin:$PATH"
+          make -C ../../user DADK="$CARGO_INSTALL_ROOT/bin/dadk" install_dadk
+          make -C ../../user DADK="$CARGO_INSTALL_ROOT/bin/dadk" install_dadk
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Check formatting
+        run: cargo fmt --all --check

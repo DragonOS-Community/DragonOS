@@ -22,7 +22,7 @@ DragonOS是一个面向云计算轻量化场景的，完全自主内核的，提
 
 - 文档：在`docs/`目录下
 - 内核：在`kernel/`目录下
-- 自行编写的单元测试程序：在`user/apps/c_unitest`目录下
+- 自行编写的用户态单元测试程序：在`user/apps/tests/dunitest`目录下
 - gvisor系统调用测试程序：根据用户给出的程序代码片段来读取测试代码。如果用户没有提供，就尝试寻找，如果找不到，则从 https://cnb.cool/DragonOS-Community/gvisor/-/tree/dragonos/release-20250616.0/test/syscalls/linux 下面获取（下载文件然后再尝试读取）
 
 

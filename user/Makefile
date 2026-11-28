@@ -11,9 +11,9 @@ SYSROOT_INSTALL_MARKER = $(ROOT_PATH)/bin/sysroot/.dadk_install_marker
 # Sysroot layout version. Layout 1 is the legacy layout where sysconfig was
 # copied into bin/sysroot via cp -r, leaking host metadata into the image.
 # Bumping this version triggers a one-time removal and DADK reinstall of
-# bin/sysroot (keeping bin/dadk_cache), so stale files left by the old
-# copy_sysconfig step are not imported into the image again as app files.
-SYSROOT_LAYOUT_VERSION = 2
+# bin/sysroot (keeping bin/dadk_cache) to remove files from previous layouts.
+# Layout 3 removes the legacy C test binaries.
+SYSROOT_LAYOUT_VERSION = 3
 ROOTFS_MANIFEST ?= default
 
 ECHO:

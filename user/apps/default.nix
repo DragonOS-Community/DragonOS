@@ -79,7 +79,6 @@ in
 
   # Simple C utilities
   (static.callPackage ./about { })
-  (static.callPackage ./c_unitest { inherit target; })
   (static.callPackage ./ebpf_smoke { inherit target; })
 
 ]

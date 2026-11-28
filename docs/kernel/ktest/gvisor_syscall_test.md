@@ -188,7 +188,7 @@ This section explains how to fix gvisor test cases, helping developers quickly p
    - If the problem is complex, we recommend first using Plan mode to develop a repair plan, then proceed with the fix.
    - If the AI assistant has difficulty locating the issue, ask it to add minimal logging at appropriate kernel locations to assist in diagnosis
    - If terminal logs are truncated, check serial_opt.txt for complete logs and share them with the AI assistant
-   - If the AI assistant struggles to locate the issue, have it write simple test programs under `user/apps/c_unitest` to address the problem. These test programs will be compiled and installed in DragonOS's bin directory.
+   - If the AI assistant struggles to locate the issue, ask it to add a focused [dunitest](./dunitest.md) test that exercises the behavior in DragonOS.
    - Always remind the AI assistant to look for reusable code and establish reasonable, appropriate abstractions. Otherwise, the code may become redundant!
 
 3. **Verify Repair Effectiveness**
